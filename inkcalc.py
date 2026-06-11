@@ -19,6 +19,8 @@ DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
 SUPPORTED_INPUT_SUFFIXES = {".pdf", ".ps", ".eps"}
 PAREN_NAME_PAT = re.compile(r"\((.+?)\)\.tif$", re.IGNORECASE)
+SEP_PAGE_PAT = re.compile(r"sep_(\d{3})", re.IGNORECASE)
+PLATE_COLOR_PAT = re.compile(r"^%%PlateColor:\s*(.+?)\s*$", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
 
@@ -125,22 +127,52 @@ def classify_plate(path: Path) -> tuple[str, str]:
     return "UNKNOWN", path.name
 
 
-def infer_separated_plate_from_source(source_path: Path) -> tuple[str, str]:
-    name = source_path.stem.strip()
-    normalized = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+def normalize_plate_name(name: str) -> tuple[str, str]:
+    clean_name = name.strip().lstrip("/")
+    normalized = re.sub(r"[^a-z0-9]+", " ", clean_name.lower()).strip()
     words = set(normalized.split())
 
-    if "cyan" in words or "c" in words:
+    if normalized == "c" or "cyan" in words:
         return "C", "C"
-    if "magenta" in words or "m" in words:
+    if normalized == "m" or "magenta" in words:
         return "M", "M"
-    if "yellow" in words or "y" in words:
+    if normalized == "y" or "yellow" in words:
         return "Y", "Y"
-    if "black" in words or "k" in words:
+    if normalized == "k" or "black" in words:
         return "K", "K"
     if "pantone" in words or "pms" in words:
-        return "SPOT", name
-    return "UNKNOWN", name
+        return "SPOT", clean_name
+    return "UNKNOWN", clean_name
+
+
+def infer_separated_plate_from_source(source_path: Path) -> tuple[str, str]:
+    return normalize_plate_name(source_path.stem)
+
+
+def extract_postscript_plate_colors(source_path: Path) -> list[tuple[str, str]]:
+    if source_path.suffix.lower() not in {".ps", ".eps"}:
+        return []
+
+    plate_colors: list[tuple[str, str]] = []
+    try:
+        with source_path.open("r", encoding="latin-1", errors="replace") as handle:
+            for line in handle:
+                match = PLATE_COLOR_PAT.match(line)
+                if match:
+                    plate_colors.append(normalize_plate_name(match.group(1)))
+    except OSError:
+        logger.exception("Failed to read PostScript plate colors: %s", source_path)
+        return []
+
+    logger.info("PostScript plate colors extracted: source=%s colors=%s", source_path, plate_colors)
+    return plate_colors
+
+
+def sep_page_index(tiff_path: Path) -> int | None:
+    match = SEP_PAGE_PAT.search(tiff_path.name)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def tiff_sum_and_count_inverted(tiff_path: Path) -> tuple[int, int]:
@@ -169,17 +201,41 @@ def _measure_tiffs(
     kinds: dict[str, str],
 ) -> None:
     source_is_separated_ps = source_path.suffix.lower() in {".ps", ".eps"}
+    ps_plate_colors = extract_postscript_plate_colors(source_path)
+    composite_tiffs: list[Path] = []
+    measured_named_plates = 0
 
     for tiff in tiffs:
         kind, label = classify_plate(tiff)
         if kind == "COMPOSITE":
-            if not source_is_separated_ps:
-                continue
-            kind, label = infer_separated_plate_from_source(source_path)
-            logger.info("Using composite TIFF as separated PS plate: source=%s label=%s", source_path, label)
+            composite_tiffs.append(tiff)
+            continue
 
         total, count = tiff_sum_and_count_inverted(tiff)
+        if source_is_separated_ps and total == 0:
+            logger.debug("Skipping empty separated PS plate: file=%s kind=%s label=%s", tiff, kind, label)
+            continue
+        page_index = sep_page_index(tiff)
+        if source_is_separated_ps and page_index and page_index <= len(ps_plate_colors):
+            kind, label = ps_plate_colors[page_index - 1]
+            logger.debug("Mapped separated PS page to plate color: file=%s page=%s label=%s", tiff, page_index, label)
+
         logger.debug("Plate measured: file=%s kind=%s label=%s pixels=%s", tiff, kind, label, count)
+        sums[label] = sums.get(label, 0) + total
+        counts[label] = counts.get(label, 0) + count
+        kinds[label] = kind
+        measured_named_plates += 1
+
+    if not source_is_separated_ps or measured_named_plates:
+        return
+
+    for tiff in composite_tiffs:
+        kind, label = infer_separated_plate_from_source(source_path)
+        logger.info("Using composite TIFF as separated PS fallback: source=%s label=%s", source_path, label)
+        total, count = tiff_sum_and_count_inverted(tiff)
+        if total == 0:
+            logger.debug("Skipping empty separated PS composite fallback: file=%s label=%s", tiff, label)
+            continue
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
