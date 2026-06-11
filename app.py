@@ -6,34 +6,45 @@ import logging
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont
-from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
-    QWidget,
-)
-
 from app_logging import setup_logging
-from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_pdf_coverage, first_pdf_near_script
 
 
+LOG_FILE = setup_logging()
 logger = logging.getLogger(__name__)
+logger.info("Application bootstrap started. Log file: %s", LOG_FILE)
+
+try:
+    from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
+    from PySide6.QtGui import QDesktopServices, QFont
+    from PySide6.QtWidgets import (
+        QApplication,
+        QFileDialog,
+        QFormLayout,
+        QFrame,
+        QGridLayout,
+        QGroupBox,
+        QHBoxLayout,
+        QHeaderView,
+        QLabel,
+        QLineEdit,
+        QMainWindow,
+        QMessageBox,
+        QPushButton,
+        QSpinBox,
+        QTableWidget,
+        QTableWidgetItem,
+        QVBoxLayout,
+        QWidget,
+    )
+except Exception:
+    logger.exception("Application startup failed while importing PySide6")
+    raise
+
+try:
+    from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_pdf_coverage, first_pdf_near_script
+except Exception:
+    logger.exception("Application startup failed while importing calculation modules")
+    raise
 
 
 class CalculationWorker(QObject):
@@ -288,12 +299,17 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
-    log_file = setup_logging()
-    logger.info("Application started. Log file: %s", log_file)
-    app = QApplication(sys.argv)
-    window = MainWindow()
-    window.show()
-    exit_code = app.exec()
+    logger.info("Application startup sequence entered")
+    try:
+        app = QApplication(sys.argv)
+        logger.info("QApplication created")
+        window = MainWindow()
+        window.show()
+        logger.info("Main window shown")
+        exit_code = app.exec()
+    except Exception:
+        logger.exception("Application startup or event loop failed")
+        raise
     logger.info("Application closed with exit code %s", exit_code)
     return exit_code
 
