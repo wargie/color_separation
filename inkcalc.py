@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from PIL import Image
 DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
 PAREN_NAME_PAT = re.compile(r"\((.+?)\)\.tif$", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -40,7 +42,9 @@ def find_ghostscript() -> str:
     for name in ("gswin64c", "gswin64c.exe", "gswin32c", "gswin32c.exe", "gs"):
         path = shutil.which(name)
         if path:
+            logger.info("Ghostscript found: %s", path)
             return path
+    logger.error("Ghostscript executable was not found in PATH")
     raise RuntimeError("Ghostscript не найден. Установите Ghostscript и добавьте gswin64c в PATH.")
 
 
@@ -52,6 +56,7 @@ def first_pdf_near_script() -> Path | None:
 def make_output_dir(output_root: Path) -> Path:
     output_dir = output_root / f"temp_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Output directory created: %s", output_dir)
     return output_dir
 
 
@@ -71,6 +76,8 @@ def run_tiffsep(gs_path: str, pdf_path: Path, output_dir: Path, dpi: int) -> lis
         f"-sOutputFile={output_file}",
         str(pdf_path),
     ]
+    logger.info("Running Ghostscript tiffsep: pdf=%s dpi=%s output=%s", pdf_path, dpi, output_dir)
+    logger.debug("Ghostscript command: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -81,8 +88,11 @@ def run_tiffsep(gs_path: str, pdf_path: Path, output_dir: Path, dpi: int) -> lis
     )
     if proc.returncode != 0:
         details = proc.stderr.strip() or proc.stdout.strip()
+        logger.error("Ghostscript failed with code %s: %s", proc.returncode, details)
         raise RuntimeError(f"Ghostscript завершился с ошибкой {proc.returncode}:\n{details}")
-    return sorted(output_dir.glob("sep_*.tif"))
+    tiffs = sorted(output_dir.glob("sep_*.tif"))
+    logger.info("Ghostscript created %s TIFF files", len(tiffs))
+    return tiffs
 
 
 def classify_plate(path: Path) -> tuple[str, str]:
@@ -122,12 +132,16 @@ def calculate_pdf_coverage(
 ) -> CoverageResult:
     pdf_path = Path(pdf_path)
     output_root = Path(output_root)
+    logger.info("Coverage calculation started: pdf=%s dpi=%s output_root=%s", pdf_path, dpi, output_root)
 
     if dpi <= 0:
+        logger.warning("Invalid DPI value: %s", dpi)
         raise ValueError("DPI должен быть положительным числом.")
     if not pdf_path.exists():
+        logger.warning("PDF file does not exist: %s", pdf_path)
         raise FileNotFoundError(f"PDF не найден: {pdf_path}")
     if pdf_path.suffix.lower() != ".pdf":
+        logger.warning("Selected file is not a PDF: %s", pdf_path)
         raise ValueError("Выберите файл PDF.")
 
     if progress:
@@ -142,6 +156,7 @@ def calculate_pdf_coverage(
         progress("Генерация цветоделения...")
     tiffs = run_tiffsep(gs_path, pdf_path, output_dir, dpi)
     if not tiffs:
+        logger.error("Ghostscript did not create separation files: %s", output_dir)
         raise RuntimeError(f"Ghostscript не создал файлов цветоделения. Папка: {output_dir}")
 
     if progress:
@@ -155,6 +170,7 @@ def calculate_pdf_coverage(
         if kind == "COMPOSITE":
             continue
         total, count = tiff_sum_and_count_inverted(tiff)
+        logger.debug("Plate measured: file=%s kind=%s label=%s pixels=%s", tiff, kind, label, count)
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
@@ -169,4 +185,10 @@ def calculate_pdf_coverage(
         )
         for label in labels
     ]
+    logger.info(
+        "Coverage calculation finished: pdf=%s plates=%s output_dir=%s",
+        pdf_path,
+        {plate.name: round(plate.percent, 4) for plate in plates},
+        output_dir,
+    )
     return CoverageResult(pdf_path=pdf_path, output_dir=output_dir, plates=plates)

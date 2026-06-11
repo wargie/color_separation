@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -28,7 +29,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app_logging import setup_logging
 from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_pdf_coverage, first_pdf_near_script
+
+
+logger = logging.getLogger(__name__)
 
 
 class CalculationWorker(QObject):
@@ -44,6 +49,7 @@ class CalculationWorker(QObject):
 
     def run(self) -> None:
         try:
+            logger.info("Worker started: pdf=%s dpi=%s output_root=%s", self.pdf_path, self.dpi, self.output_root)
             result = calculate_pdf_coverage(
                 self.pdf_path,
                 dpi=self.dpi,
@@ -51,8 +57,10 @@ class CalculationWorker(QObject):
                 progress=self.progress.emit,
             )
         except Exception as exc:
+            logger.exception("Worker failed during calculation")
             self.failed.emit(str(exc))
             return
+        logger.info("Worker finished successfully")
         self.finished.emit(result)
 
 
@@ -72,6 +80,7 @@ class MainWindow(QMainWindow):
         default_pdf = first_pdf_near_script()
         if default_pdf:
             self.pdf_input.setText(str(default_pdf))
+            logger.info("Default PDF selected on startup: %s", default_pdf)
 
         self.output_input = QLineEdit(str(DEFAULT_OUTPUT_ROOT))
         self.dpi_input = QSpinBox()
@@ -101,6 +110,7 @@ class MainWindow(QMainWindow):
 
         self._build_layout()
         self._apply_style()
+        logger.info("Main window initialized")
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -183,20 +193,31 @@ class MainWindow(QMainWindow):
         )
 
     def choose_pdf(self) -> None:
+        logger.info("User opened PDF chooser")
         file_name, _ = QFileDialog.getOpenFileName(self, "Выберите PDF", "", "PDF (*.pdf)")
         if file_name:
             self.pdf_input.setText(file_name)
+            logger.info("User selected PDF: %s", file_name)
+        else:
+            logger.info("User cancelled PDF chooser")
 
     def choose_output_root(self) -> None:
+        logger.info("User opened output directory chooser")
         directory = QFileDialog.getExistingDirectory(self, "Выберите папку вывода", self.output_input.text())
         if directory:
             self.output_input.setText(directory)
+            logger.info("User selected output directory: %s", directory)
+        else:
+            logger.info("User cancelled output directory chooser")
 
     def start_calculation(self) -> None:
         pdf_path = Path(self.pdf_input.text().strip())
         output_root = Path(self.output_input.text().strip())
+        dpi = self.dpi_input.value()
+        logger.info("User started calculation: pdf=%s dpi=%s output_root=%s", pdf_path, dpi, output_root)
 
         if not pdf_path.exists():
+            logger.warning("Calculation blocked: selected PDF does not exist: %s", pdf_path)
             QMessageBox.warning(self, "Файл не найден", "Выберите существующий PDF-файл.")
             return
 
@@ -205,7 +226,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Запуск расчёта...")
 
         self.thread = QThread(self)
-        self.worker = CalculationWorker(pdf_path, self.dpi_input.value(), output_root)
+        self.worker = CalculationWorker(pdf_path, dpi, output_root)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.status_label.setText)
@@ -217,6 +238,12 @@ class MainWindow(QMainWindow):
         self.thread.start()
 
     def on_finished(self, result: CoverageResult) -> None:
+        logger.info(
+            "Calculation completed in GUI: pdf=%s output_dir=%s plates=%s",
+            result.pdf_path,
+            result.output_dir,
+            {plate.name: round(plate.percent, 4) for plate in result.plates},
+        )
         self.last_result = result
         self.table.setRowCount(len(result.plates))
         for row, plate in enumerate(result.plates):
@@ -232,11 +259,13 @@ class MainWindow(QMainWindow):
         self.set_busy(False)
 
     def on_failed(self, message: str) -> None:
+        logger.error("Calculation failed in GUI: %s", message)
         self.status_label.setText("Ошибка")
         self.set_busy(False)
         QMessageBox.critical(self, "Ошибка расчёта", message)
 
     def cleanup_worker(self) -> None:
+        logger.info("Cleaning up worker thread")
         if self.worker:
             self.worker.deleteLater()
         if self.thread:
@@ -252,14 +281,21 @@ class MainWindow(QMainWindow):
 
     def open_output_dir(self) -> None:
         if self.last_result:
+            logger.info("User opened output directory: %s", self.last_result.output_dir)
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_result.output_dir)))
+        else:
+            logger.warning("User tried to open output directory before calculation result exists")
 
 
 def main() -> int:
+    log_file = setup_logging()
+    logger.info("Application started. Log file: %s", log_file)
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    return app.exec()
+    exit_code = app.exec()
+    logger.info("Application closed with exit code %s", exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
