@@ -39,6 +39,7 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSplitter,
         QSpinBox,
         QTableWidget,
@@ -95,6 +96,8 @@ class MainWindow(QMainWindow):
         self.worker: CalculationWorker | None = None
         self.last_result: CoverageResult | None = None
         self.preview_layers: list[dict[str, object]] = []
+        self.preview_zoom = 1.0
+        self.preview_pixmap: QPixmap | None = None
 
         self.source_input = QLineEdit()
         self.source_input.setPlaceholderText("Выберите PDF, PS или EPS. Для нескольких файлов используйте кнопку Обзор...")
@@ -130,11 +133,23 @@ class MainWindow(QMainWindow):
         self.move_layer_down_button = QPushButton("Вниз")
         self.move_layer_down_button.clicked.connect(self.move_selected_layer_down)
 
+        self.zoom_out_button = QPushButton("-")
+        self.zoom_out_button.clicked.connect(self.zoom_out_preview)
+        self.zoom_reset_button = QPushButton("100%")
+        self.zoom_reset_button.clicked.connect(self.reset_preview_zoom)
+        self.zoom_in_button = QPushButton("+")
+        self.zoom_in_button.clicked.connect(self.zoom_in_preview)
+
         self.preview_label = QLabel("Предпросмотр появится после расчёта")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(360, 260)
         self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
         self.preview_label.setStyleSheet("background: #ffffff;")
+
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(False)
+        self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_scroll.setWidget(self.preview_label)
 
         self.calculate_button = QPushButton("Рассчитать")
         self.calculate_button.clicked.connect(self.start_calculation)
@@ -188,9 +203,14 @@ class MainWindow(QMainWindow):
         layer_actions = QHBoxLayout()
         layer_actions.addWidget(self.move_layer_up_button)
         layer_actions.addWidget(self.move_layer_down_button)
+        zoom_actions = QHBoxLayout()
+        zoom_actions.addWidget(self.zoom_out_button)
+        zoom_actions.addWidget(self.zoom_reset_button)
+        zoom_actions.addWidget(self.zoom_in_button)
         preview_layout.addWidget(self.layer_list, 1)
         preview_layout.addLayout(layer_actions)
-        preview_layout.addWidget(self.preview_label, 3)
+        preview_layout.addLayout(zoom_actions)
+        preview_layout.addWidget(self.preview_scroll, 3)
 
         result_splitter.addWidget(left_panel)
         result_splitter.addWidget(preview_group)
@@ -347,6 +367,9 @@ class MainWindow(QMainWindow):
         self.layer_list.setEnabled(not busy)
         self.move_layer_up_button.setEnabled(not busy)
         self.move_layer_down_button.setEnabled(not busy)
+        self.zoom_out_button.setEnabled(not busy)
+        self.zoom_reset_button.setEnabled(not busy)
+        self.zoom_in_button.setEnabled(not busy)
 
     def open_output_dir(self) -> None:
         if self.last_result:
@@ -376,6 +399,7 @@ class MainWindow(QMainWindow):
             item.setCheckState(Qt.CheckState.Checked)
             self.layer_list.addItem(item)
         self.layer_list.blockSignals(False)
+        self.preview_zoom = 1.0
         self.render_preview()
 
     def on_layer_changed(self, item: QListWidgetItem) -> None:
@@ -403,11 +427,27 @@ class MainWindow(QMainWindow):
         logger.info("Preview layer moved: from=%s to=%s", row, new_row)
         self.render_preview()
 
+    def zoom_in_preview(self) -> None:
+        self.set_preview_zoom(self.preview_zoom * 1.25)
+
+    def zoom_out_preview(self) -> None:
+        self.set_preview_zoom(self.preview_zoom / 1.25)
+
+    def reset_preview_zoom(self) -> None:
+        self.set_preview_zoom(1.0)
+
+    def set_preview_zoom(self, zoom: float) -> None:
+        self.preview_zoom = min(6.0, max(0.1, zoom))
+        self.zoom_reset_button.setText(f"{int(self.preview_zoom * 100)}%")
+        logger.info("Preview zoom changed: %.2f", self.preview_zoom)
+        self.apply_preview_zoom()
+
     def render_preview(self) -> None:
         enabled_layers = [layer for layer in self.preview_layers if layer.get("enabled")]
         if not enabled_layers:
             self.preview_label.setText("Все каналы выключены")
             self.preview_label.setPixmap(QPixmap())
+            self.preview_pixmap = None
             return
 
         try:
@@ -416,27 +456,41 @@ class MainWindow(QMainWindow):
             logger.exception("Failed to render separation preview")
             self.preview_label.setText("Не удалось построить предпросмотр")
             self.preview_label.setPixmap(QPixmap())
+            self.preview_pixmap = None
             return
 
         qimage = pil_image_to_qimage(preview)
-        pixmap = QPixmap.fromImage(qimage)
-        scaled = pixmap.scaled(
-            self.preview_label.size(),
+        self.preview_pixmap = QPixmap.fromImage(qimage)
+        self.apply_preview_zoom()
+
+    def apply_preview_zoom(self) -> None:
+        if self.preview_pixmap is None:
+            return
+        source_size = self.preview_pixmap.size()
+        target_size = source_size.scaled(
+            int(source_size.width() * self.preview_zoom),
+            int(source_size.height() * self.preview_zoom),
+            Qt.AspectRatioMode.KeepAspectRatio,
+        )
+        scaled = self.preview_pixmap.scaled(
+            target_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
+        self.preview_label.setText("")
         self.preview_label.setPixmap(scaled)
+        self.preview_label.resize(scaled.size())
 
 
-def preview_color(name: str) -> tuple[int, int, int]:
-    colors = {
-        "C": (0, 174, 239),
-        "M": (236, 0, 140),
-        "Y": (255, 242, 0),
+def preview_ink_rgb(name: str) -> tuple[int, int, int]:
+    process_colors = {
+        "C": (0, 255, 255),
+        "M": (255, 0, 255),
+        "Y": (255, 255, 0),
         "K": (0, 0, 0),
     }
-    if name in colors:
-        return colors[name]
+    if name in process_colors:
+        return process_colors[name]
     seed = sum(ord(ch) for ch in name)
     return ((seed * 37) % 206 + 25, (seed * 67) % 206 + 25, (seed * 97) % 206 + 25)
 
@@ -454,9 +508,10 @@ def build_preview_image(layers: list[dict[str, object]], max_size: int = 1200) -
         elif image.size != base_size:
             image = image.resize(base_size, Image.Resampling.LANCZOS)
 
-        coverage = (255.0 - np.asarray(image, dtype=np.float32)) / 255.0
-        color = np.asarray(preview_color(str(layer["name"])), dtype=np.float32)
-        composite = composite * (1.0 - coverage[..., None]) + color * coverage[..., None]
+        ink = (255.0 - np.asarray(image, dtype=np.float32)) / 255.0
+        color = np.asarray(preview_ink_rgb(str(layer["name"])), dtype=np.float32) / 255.0
+        transmittance = 1.0 - ink[..., None] * (1.0 - color)
+        composite = composite * transmittance
 
     if composite is None:
         return Image.new("RGB", (600, 400), "white")
