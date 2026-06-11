@@ -17,6 +17,7 @@ from PIL import Image
 
 DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
+SUPPORTED_INPUT_SUFFIXES = {".pdf", ".ps", ".eps"}
 PAREN_NAME_PAT = re.compile(r"\((.+?)\)\.tif$", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class PlateCoverage:
 @dataclass(frozen=True)
 class CoverageResult:
     pdf_path: Path
+    source_paths: list[Path]
     output_dir: Path
     plates: list[PlateCoverage]
 
@@ -48,9 +50,17 @@ def find_ghostscript() -> str:
     raise RuntimeError("Ghostscript не найден. Установите Ghostscript и добавьте gswin64c в PATH.")
 
 
+def first_supported_file_near_script() -> Path | None:
+    files = [
+        path
+        for path in Path(__file__).resolve().parent.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_INPUT_SUFFIXES
+    ]
+    return sorted(files)[0] if files else None
+
+
 def first_pdf_near_script() -> Path | None:
-    pdfs = sorted(Path(__file__).resolve().parent.glob("*.pdf"))
-    return pdfs[0] if pdfs else None
+    return first_supported_file_near_script()
 
 
 def make_output_dir(output_root: Path) -> Path:
@@ -60,7 +70,7 @@ def make_output_dir(output_root: Path) -> Path:
     return output_dir
 
 
-def run_tiffsep(gs_path: str, pdf_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+def run_tiffsep(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "sep_%03d.tif"
     cmd = [
@@ -74,9 +84,9 @@ def run_tiffsep(gs_path: str, pdf_path: Path, output_dir: Path, dpi: int) -> lis
         "-dOverprint=true",
         "-dOPM=1",
         f"-sOutputFile={output_file}",
-        str(pdf_path),
+        str(source_path),
     ]
-    logger.info("Running Ghostscript tiffsep: pdf=%s dpi=%s output=%s", pdf_path, dpi, output_dir)
+    logger.info("Running Ghostscript tiffsep: source=%s dpi=%s output=%s", source_path, dpi, output_dir)
     logger.debug("Ghostscript command: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd,
@@ -115,6 +125,24 @@ def classify_plate(path: Path) -> tuple[str, str]:
     return "UNKNOWN", path.name
 
 
+def infer_separated_plate_from_source(source_path: Path) -> tuple[str, str]:
+    name = source_path.stem.strip()
+    normalized = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+    words = set(normalized.split())
+
+    if "cyan" in words or "c" in words:
+        return "C", "C"
+    if "magenta" in words or "m" in words:
+        return "M", "M"
+    if "yellow" in words or "y" in words:
+        return "Y", "Y"
+    if "black" in words or "k" in words:
+        return "K", "K"
+    if "pantone" in words or "pms" in words:
+        return "SPOT", name
+    return "UNKNOWN", name
+
+
 def tiff_sum_and_count_inverted(tiff_path: Path) -> tuple[int, int]:
     with Image.open(tiff_path) as image:
         if image.mode != "L":
@@ -124,25 +152,58 @@ def tiff_sum_and_count_inverted(tiff_path: Path) -> tuple[int, int]:
     return int(inverted.sum()), int(inverted.size)
 
 
-def calculate_pdf_coverage(
-    pdf_path: Path,
+def _validate_source_path(source_path: Path) -> None:
+    if not source_path.exists():
+        logger.warning("Input file does not exist: %s", source_path)
+        raise FileNotFoundError(f"Файл не найден: {source_path}")
+    if source_path.suffix.lower() not in SUPPORTED_INPUT_SUFFIXES:
+        logger.warning("Unsupported input file format: %s", source_path)
+        raise ValueError("Выберите файл PDF, PS или EPS.")
+
+
+def _measure_tiffs(
+    tiffs: list[Path],
+    source_path: Path,
+    sums: dict[str, int],
+    counts: dict[str, int],
+    kinds: dict[str, str],
+) -> None:
+    source_is_separated_ps = source_path.suffix.lower() in {".ps", ".eps"}
+
+    for tiff in tiffs:
+        kind, label = classify_plate(tiff)
+        if kind == "COMPOSITE":
+            if not source_is_separated_ps:
+                continue
+            kind, label = infer_separated_plate_from_source(source_path)
+            logger.info("Using composite TIFF as separated PS plate: source=%s label=%s", source_path, label)
+
+        total, count = tiff_sum_and_count_inverted(tiff)
+        logger.debug("Plate measured: file=%s kind=%s label=%s pixels=%s", tiff, kind, label, count)
+        sums[label] = sums.get(label, 0) + total
+        counts[label] = counts.get(label, 0) + count
+        kinds[label] = kind
+
+
+def calculate_sources_coverage(
+    source_paths: list[Path],
     dpi: int = DEFAULT_DPI,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
     progress: ProgressCallback | None = None,
 ) -> CoverageResult:
-    pdf_path = Path(pdf_path)
+    source_paths = [Path(path) for path in source_paths]
     output_root = Path(output_root)
-    logger.info("Coverage calculation started: pdf=%s dpi=%s output_root=%s", pdf_path, dpi, output_root)
+    logger.info("Coverage calculation started: sources=%s dpi=%s output_root=%s", source_paths, dpi, output_root)
 
     if dpi <= 0:
         logger.warning("Invalid DPI value: %s", dpi)
         raise ValueError("DPI должен быть положительным числом.")
-    if not pdf_path.exists():
-        logger.warning("PDF file does not exist: %s", pdf_path)
-        raise FileNotFoundError(f"PDF не найден: {pdf_path}")
-    if pdf_path.suffix.lower() != ".pdf":
-        logger.warning("Selected file is not a PDF: %s", pdf_path)
-        raise ValueError("Выберите файл PDF.")
+    if not source_paths:
+        logger.warning("Coverage calculation requested without input files")
+        raise ValueError("Выберите хотя бы один файл PDF, PS или EPS.")
+
+    for source_path in source_paths:
+        _validate_source_path(source_path)
 
     if progress:
         progress("Поиск Ghostscript...")
@@ -152,28 +213,22 @@ def calculate_pdf_coverage(
         progress("Создание папки вывода...")
     output_dir = make_output_dir(output_root)
 
-    if progress:
-        progress("Генерация цветоделения...")
-    tiffs = run_tiffsep(gs_path, pdf_path, output_dir, dpi)
-    if not tiffs:
-        logger.error("Ghostscript did not create separation files: %s", output_dir)
-        raise RuntimeError(f"Ghostscript не создал файлов цветоделения. Папка: {output_dir}")
-
-    if progress:
-        progress("Расчёт покрытия...")
     sums: dict[str, int] = {}
     counts: dict[str, int] = {}
     kinds: dict[str, str] = {}
 
-    for tiff in tiffs:
-        kind, label = classify_plate(tiff)
-        if kind == "COMPOSITE":
-            continue
-        total, count = tiff_sum_and_count_inverted(tiff)
-        logger.debug("Plate measured: file=%s kind=%s label=%s pixels=%s", tiff, kind, label, count)
-        sums[label] = sums.get(label, 0) + total
-        counts[label] = counts.get(label, 0) + count
-        kinds[label] = kind
+    for index, source_path in enumerate(source_paths, start=1):
+        if progress:
+            progress(f"Генерация цветоделения {index}/{len(source_paths)}...")
+        source_output_dir = output_dir if len(source_paths) == 1 else output_dir / f"{index:03d}_{source_path.stem}"
+        tiffs = run_tiffsep(gs_path, source_path, source_output_dir, dpi)
+        if not tiffs:
+            logger.error("Ghostscript did not create separation files: %s", source_output_dir)
+            raise RuntimeError(f"Ghostscript не создал файлов цветоделения. Папка: {source_output_dir}")
+
+        if progress:
+            progress(f"Расчёт покрытия {index}/{len(source_paths)}...")
+        _measure_tiffs(tiffs, source_path, sums, counts, kinds)
 
     order = {"C": 0, "M": 1, "Y": 2, "K": 3}
     labels = sorted(sums, key=lambda value: (order.get(value, 100), value.lower()))
@@ -185,10 +240,23 @@ def calculate_pdf_coverage(
         )
         for label in labels
     ]
+    if not plates:
+        logger.error("No measurable plates were found: sources=%s output_dir=%s", source_paths, output_dir)
+        raise RuntimeError(f"Не найдено измеримых цветовых пластин. Папка: {output_dir}")
+
     logger.info(
-        "Coverage calculation finished: pdf=%s plates=%s output_dir=%s",
-        pdf_path,
+        "Coverage calculation finished: sources=%s plates=%s output_dir=%s",
+        source_paths,
         {plate.name: round(plate.percent, 4) for plate in plates},
         output_dir,
     )
-    return CoverageResult(pdf_path=pdf_path, output_dir=output_dir, plates=plates)
+    return CoverageResult(pdf_path=source_paths[0], source_paths=source_paths, output_dir=output_dir, plates=plates)
+
+
+def calculate_pdf_coverage(
+    pdf_path: Path,
+    dpi: int = DEFAULT_DPI,
+    output_root: Path = DEFAULT_OUTPUT_ROOT,
+    progress: ProgressCallback | None = None,
+) -> CoverageResult:
+    return calculate_sources_coverage([Path(pdf_path)], dpi=dpi, output_root=output_root, progress=progress)

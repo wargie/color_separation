@@ -41,7 +41,7 @@ except Exception:
     raise
 
 try:
-    from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_pdf_coverage, first_pdf_near_script
+    from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_sources_coverage, first_supported_file_near_script
 except Exception:
     logger.exception("Application startup failed while importing calculation modules")
     raise
@@ -52,17 +52,17 @@ class CalculationWorker(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, pdf_path: Path, dpi: int, output_root: Path) -> None:
+    def __init__(self, source_paths: list[Path], dpi: int, output_root: Path) -> None:
         super().__init__()
-        self.pdf_path = pdf_path
+        self.source_paths = source_paths
         self.dpi = dpi
         self.output_root = output_root
 
     def run(self) -> None:
         try:
-            logger.info("Worker started: pdf=%s dpi=%s output_root=%s", self.pdf_path, self.dpi, self.output_root)
-            result = calculate_pdf_coverage(
-                self.pdf_path,
+            logger.info("Worker started: sources=%s dpi=%s output_root=%s", self.source_paths, self.dpi, self.output_root)
+            result = calculate_sources_coverage(
+                self.source_paths,
                 dpi=self.dpi,
                 output_root=self.output_root,
                 progress=self.progress.emit,
@@ -85,13 +85,13 @@ class MainWindow(QMainWindow):
         self.worker: CalculationWorker | None = None
         self.last_result: CoverageResult | None = None
 
-        self.pdf_input = QLineEdit()
-        self.pdf_input.setPlaceholderText("Выберите PDF-файл")
+        self.source_input = QLineEdit()
+        self.source_input.setPlaceholderText("Выберите PDF, PS или EPS. Для нескольких файлов используйте кнопку Обзор...")
 
-        default_pdf = first_pdf_near_script()
-        if default_pdf:
-            self.pdf_input.setText(str(default_pdf))
-            logger.info("Default PDF selected on startup: %s", default_pdf)
+        default_source = first_supported_file_near_script()
+        if default_source:
+            self.source_input.setText(str(default_source))
+            logger.info("Default input file selected on startup: %s", default_source)
 
         self.output_input = QLineEdit(str(DEFAULT_OUTPUT_ROOT))
         self.dpi_input = QSpinBox()
@@ -130,14 +130,14 @@ class MainWindow(QMainWindow):
         file_group = QGroupBox("Файл и параметры")
         file_layout = QGridLayout(file_group)
 
-        browse_pdf_button = QPushButton("Обзор...")
-        browse_pdf_button.clicked.connect(self.choose_pdf)
+        browse_source_button = QPushButton("Обзор...")
+        browse_source_button.clicked.connect(self.choose_sources)
         browse_output_button = QPushButton("Обзор...")
         browse_output_button.clicked.connect(self.choose_output_root)
 
-        file_layout.addWidget(QLabel("PDF"), 0, 0)
-        file_layout.addWidget(self.pdf_input, 0, 1)
-        file_layout.addWidget(browse_pdf_button, 0, 2)
+        file_layout.addWidget(QLabel("Файлы"), 0, 0)
+        file_layout.addWidget(self.source_input, 0, 1)
+        file_layout.addWidget(browse_source_button, 0, 2)
         file_layout.addWidget(QLabel("Папка вывода"), 1, 0)
         file_layout.addWidget(self.output_input, 1, 1)
         file_layout.addWidget(browse_output_button, 1, 2)
@@ -203,14 +203,19 @@ class MainWindow(QMainWindow):
             """
         )
 
-    def choose_pdf(self) -> None:
-        logger.info("User opened PDF chooser")
-        file_name, _ = QFileDialog.getOpenFileName(self, "Выберите PDF", "", "PDF (*.pdf)")
-        if file_name:
-            self.pdf_input.setText(file_name)
-            logger.info("User selected PDF: %s", file_name)
+    def choose_sources(self) -> None:
+        logger.info("User opened input file chooser")
+        file_names, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Выберите PDF, PS или EPS",
+            "",
+            "PDF/PostScript (*.pdf *.ps *.eps);;PDF (*.pdf);;PostScript (*.ps *.eps)",
+        )
+        if file_names:
+            self.source_input.setText("; ".join(file_names))
+            logger.info("User selected input files: %s", file_names)
         else:
-            logger.info("User cancelled PDF chooser")
+            logger.info("User cancelled input file chooser")
 
     def choose_output_root(self) -> None:
         logger.info("User opened output directory chooser")
@@ -222,14 +227,20 @@ class MainWindow(QMainWindow):
             logger.info("User cancelled output directory chooser")
 
     def start_calculation(self) -> None:
-        pdf_path = Path(self.pdf_input.text().strip())
+        source_paths = self.parse_source_paths()
         output_root = Path(self.output_input.text().strip())
         dpi = self.dpi_input.value()
-        logger.info("User started calculation: pdf=%s dpi=%s output_root=%s", pdf_path, dpi, output_root)
+        logger.info("User started calculation: sources=%s dpi=%s output_root=%s", source_paths, dpi, output_root)
 
-        if not pdf_path.exists():
-            logger.warning("Calculation blocked: selected PDF does not exist: %s", pdf_path)
-            QMessageBox.warning(self, "Файл не найден", "Выберите существующий PDF-файл.")
+        if not source_paths:
+            logger.warning("Calculation blocked: no input files selected")
+            QMessageBox.warning(self, "Файлы не выбраны", "Выберите хотя бы один PDF, PS или EPS.")
+            return
+
+        missing_paths = [path for path in source_paths if not path.exists()]
+        if missing_paths:
+            logger.warning("Calculation blocked: selected input files do not exist: %s", missing_paths)
+            QMessageBox.warning(self, "Файл не найден", f"Файл не найден:\n{missing_paths[0]}")
             return
 
         self.set_busy(True)
@@ -237,7 +248,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Запуск расчёта...")
 
         self.thread = QThread(self)
-        self.worker = CalculationWorker(pdf_path, dpi, output_root)
+        self.worker = CalculationWorker(source_paths, dpi, output_root)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.status_label.setText)
@@ -250,8 +261,8 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, result: CoverageResult) -> None:
         logger.info(
-            "Calculation completed in GUI: pdf=%s output_dir=%s plates=%s",
-            result.pdf_path,
+            "Calculation completed in GUI: sources=%s output_dir=%s plates=%s",
+            result.source_paths,
             result.output_dir,
             {plate.name: round(plate.percent, 4) for plate in result.plates},
         )
@@ -286,7 +297,7 @@ class MainWindow(QMainWindow):
 
     def set_busy(self, busy: bool) -> None:
         self.calculate_button.setEnabled(not busy)
-        self.pdf_input.setEnabled(not busy)
+        self.source_input.setEnabled(not busy)
         self.output_input.setEnabled(not busy)
         self.dpi_input.setEnabled(not busy)
 
@@ -296,6 +307,12 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_result.output_dir)))
         else:
             logger.warning("User tried to open output directory before calculation result exists")
+
+    def parse_source_paths(self) -> list[Path]:
+        raw_value = self.source_input.text().strip()
+        if not raw_value:
+            return []
+        return [Path(item.strip().strip('"')) for item in raw_value.split(";") if item.strip()]
 
 
 def main() -> int:
