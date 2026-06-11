@@ -193,17 +193,24 @@ def _validate_source_path(source_path: Path) -> None:
         raise ValueError("Выберите файл PDF, PS или EPS.")
 
 
+def safe_filename_part(value: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", value).strip(" ._")
+    return cleaned or "plate"
+
+
 def _measure_tiffs(
     tiffs: list[Path],
     source_path: Path,
     sums: dict[str, int],
     counts: dict[str, int],
     kinds: dict[str, str],
-) -> None:
+) -> tuple[set[Path], dict[Path, str]]:
     source_is_separated_ps = source_path.suffix.lower() in {".ps", ".eps"}
     ps_plate_colors = extract_postscript_plate_colors(source_path)
     composite_tiffs: list[Path] = []
     measured_named_plates = 0
+    used_tiffs: set[Path] = set()
+    rename_labels: dict[Path, str] = {}
 
     for tiff in tiffs:
         kind, label = classify_plate(tiff)
@@ -219,15 +226,17 @@ def _measure_tiffs(
         if source_is_separated_ps and page_index and page_index <= len(ps_plate_colors):
             kind, label = ps_plate_colors[page_index - 1]
             logger.debug("Mapped separated PS page to plate color: file=%s page=%s label=%s", tiff, page_index, label)
+            rename_labels[tiff] = label
 
         logger.debug("Plate measured: file=%s kind=%s label=%s pixels=%s", tiff, kind, label, count)
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
         measured_named_plates += 1
+        used_tiffs.add(tiff)
 
     if not source_is_separated_ps or measured_named_plates:
-        return
+        return used_tiffs, rename_labels
 
     for tiff in composite_tiffs:
         kind, label = infer_separated_plate_from_source(source_path)
@@ -239,6 +248,43 @@ def _measure_tiffs(
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
+        used_tiffs.add(tiff)
+        rename_labels[tiff] = label
+    return used_tiffs, rename_labels
+
+
+def cleanup_unused_tiffs(tiffs: list[Path], used_tiffs: set[Path]) -> None:
+    used_resolved = {path.resolve() for path in used_tiffs}
+    for tiff in tiffs:
+        if tiff.resolve() in used_resolved:
+            continue
+        try:
+            tiff.unlink()
+            logger.info("Removed unused separation TIFF: %s", tiff)
+        except OSError:
+            logger.exception("Failed to remove unused separation TIFF: %s", tiff)
+
+
+def rename_used_tiffs(rename_labels: dict[Path, str]) -> None:
+    used_targets: set[Path] = set()
+    for source_path, label in rename_labels.items():
+        if not source_path.exists():
+            continue
+        target = source_path.with_name(f"{safe_filename_part(label)}.tif")
+        if target == source_path:
+            continue
+        if target.exists() or target in used_targets:
+            stem = target.stem
+            counter = 2
+            while target.exists() or target in used_targets:
+                target = source_path.with_name(f"{stem}_{counter}.tif")
+                counter += 1
+        try:
+            source_path.rename(target)
+            used_targets.add(target)
+            logger.info("Renamed separation TIFF: %s -> %s", source_path, target)
+        except OSError:
+            logger.exception("Failed to rename separation TIFF: %s", source_path)
 
 
 def calculate_sources_coverage(
@@ -272,6 +318,9 @@ def calculate_sources_coverage(
     sums: dict[str, int] = {}
     counts: dict[str, int] = {}
     kinds: dict[str, str] = {}
+    all_tiffs: list[Path] = []
+    used_tiffs: set[Path] = set()
+    rename_labels: dict[Path, str] = {}
 
     for index, source_path in enumerate(source_paths, start=1):
         if progress:
@@ -284,7 +333,10 @@ def calculate_sources_coverage(
 
         if progress:
             progress(f"Расчёт покрытия {index}/{len(source_paths)}...")
-        _measure_tiffs(tiffs, source_path, sums, counts, kinds)
+        all_tiffs.extend(tiffs)
+        source_used_tiffs, source_rename_labels = _measure_tiffs(tiffs, source_path, sums, counts, kinds)
+        used_tiffs.update(source_used_tiffs)
+        rename_labels.update(source_rename_labels)
 
     order = {"C": 0, "M": 1, "Y": 2, "K": 3}
     labels = sorted(sums, key=lambda value: (order.get(value, 100), value.lower()))
@@ -299,6 +351,9 @@ def calculate_sources_coverage(
     if not plates:
         logger.error("No measurable plates were found: sources=%s output_dir=%s", source_paths, output_dir)
         raise RuntimeError(f"Не найдено измеримых цветовых пластин. Папка: {output_dir}")
+
+    cleanup_unused_tiffs(all_tiffs, used_tiffs)
+    rename_used_tiffs(rename_labels)
 
     logger.info(
         "Coverage calculation finished: sources=%s plates=%s output_dir=%s",
