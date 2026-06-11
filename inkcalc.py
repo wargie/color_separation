@@ -29,6 +29,7 @@ class PlateCoverage:
     name: str
     percent: float
     kind: str
+    tiff_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,7 @@ def _measure_tiffs(
     sums: dict[str, int],
     counts: dict[str, int],
     kinds: dict[str, str],
+    plate_paths: dict[str, Path],
 ) -> tuple[set[Path], dict[Path, str]]:
     source_is_separated_ps = source_path.suffix.lower() in {".ps", ".eps"}
     ps_plate_colors = extract_postscript_plate_colors(source_path)
@@ -232,6 +234,7 @@ def _measure_tiffs(
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
+        plate_paths[label] = tiff
         measured_named_plates += 1
         used_tiffs.add(tiff)
 
@@ -248,6 +251,7 @@ def _measure_tiffs(
         sums[label] = sums.get(label, 0) + total
         counts[label] = counts.get(label, 0) + count
         kinds[label] = kind
+        plate_paths[label] = tiff
         used_tiffs.add(tiff)
         rename_labels[tiff] = label
     return used_tiffs, rename_labels
@@ -265,13 +269,16 @@ def cleanup_unused_tiffs(tiffs: list[Path], used_tiffs: set[Path]) -> None:
             logger.exception("Failed to remove unused separation TIFF: %s", tiff)
 
 
-def rename_used_tiffs(rename_labels: dict[Path, str]) -> None:
+def rename_used_tiffs(rename_labels: dict[Path, str]) -> dict[Path, Path]:
+    renamed_paths: dict[Path, Path] = {}
     used_targets: set[Path] = set()
     for source_path, label in rename_labels.items():
         if not source_path.exists():
+            renamed_paths[source_path] = source_path
             continue
         target = source_path.with_name(f"{safe_filename_part(label)}.tif")
         if target == source_path:
+            renamed_paths[source_path] = source_path
             continue
         if target.exists() or target in used_targets:
             stem = target.stem
@@ -281,10 +288,13 @@ def rename_used_tiffs(rename_labels: dict[Path, str]) -> None:
                 counter += 1
         try:
             source_path.rename(target)
+            renamed_paths[source_path] = target
             used_targets.add(target)
             logger.info("Renamed separation TIFF: %s -> %s", source_path, target)
         except OSError:
             logger.exception("Failed to rename separation TIFF: %s", source_path)
+            renamed_paths[source_path] = source_path
+    return renamed_paths
 
 
 def calculate_sources_coverage(
@@ -318,6 +328,7 @@ def calculate_sources_coverage(
     sums: dict[str, int] = {}
     counts: dict[str, int] = {}
     kinds: dict[str, str] = {}
+    plate_paths: dict[str, Path] = {}
     all_tiffs: list[Path] = []
     used_tiffs: set[Path] = set()
     rename_labels: dict[Path, str] = {}
@@ -334,9 +345,17 @@ def calculate_sources_coverage(
         if progress:
             progress(f"Расчёт покрытия {index}/{len(source_paths)}...")
         all_tiffs.extend(tiffs)
-        source_used_tiffs, source_rename_labels = _measure_tiffs(tiffs, source_path, sums, counts, kinds)
+        source_used_tiffs, source_rename_labels = _measure_tiffs(tiffs, source_path, sums, counts, kinds, plate_paths)
         used_tiffs.update(source_used_tiffs)
         rename_labels.update(source_rename_labels)
+
+    if not sums:
+        logger.error("No measurable plates were found: sources=%s output_dir=%s", source_paths, output_dir)
+        raise RuntimeError(f"Не найдено измеримых цветовых пластин. Папка: {output_dir}")
+
+    cleanup_unused_tiffs(all_tiffs, used_tiffs)
+    renamed_paths = rename_used_tiffs(rename_labels)
+    plate_paths = {label: renamed_paths.get(path, path) for label, path in plate_paths.items()}
 
     order = {"C": 0, "M": 1, "Y": 2, "K": 3}
     labels = sorted(sums, key=lambda value: (order.get(value, 100), value.lower()))
@@ -345,15 +364,10 @@ def calculate_sources_coverage(
             name=label,
             percent=(sums[label] / (counts[label] * 255.0)) * 100.0,
             kind=kinds.get(label, "UNKNOWN"),
+            tiff_path=plate_paths.get(label),
         )
         for label in labels
     ]
-    if not plates:
-        logger.error("No measurable plates were found: sources=%s output_dir=%s", source_paths, output_dir)
-        raise RuntimeError(f"Не найдено измеримых цветовых пластин. Папка: {output_dir}")
-
-    cleanup_unused_tiffs(all_tiffs, used_tiffs)
-    rename_used_tiffs(rename_labels)
 
     logger.info(
         "Coverage calculation finished: sources=%s plates=%s output_dir=%s",
