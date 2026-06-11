@@ -25,6 +25,7 @@ try:
     from PySide6.QtGui import QDesktopServices, QFont, QImage, QPixmap
     from PySide6.QtWidgets import (
         QApplication,
+        QComboBox,
         QFileDialog,
         QFormLayout,
         QFrame,
@@ -53,6 +54,17 @@ except Exception:
 
 try:
     from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_sources_coverage, first_supported_file_near_script
+    from halftone import (
+        DEFAULT_SCREEN_FREQUENCY,
+        SCREEN_MODE_AM,
+        SCREEN_MODE_FM,
+        SCREEN_MODE_HYBRID,
+        SCREEN_MODE_NONE,
+        apply_am_halftone,
+        apply_fm_halftone,
+        apply_hybrid_halftone,
+        default_screen_angle,
+    )
 except Exception:
     logger.exception("Application startup failed while importing calculation modules")
     raise
@@ -140,6 +152,19 @@ class MainWindow(QMainWindow):
         self.zoom_in_button = QPushButton("+")
         self.zoom_in_button.clicked.connect(self.zoom_in_preview)
 
+        self.screen_mode_input = QComboBox()
+        self.screen_mode_input.addItem("Без растра", SCREEN_MODE_NONE)
+        self.screen_mode_input.addItem("Традиционный AM", SCREEN_MODE_AM)
+        self.screen_mode_input.addItem("Стохастика FM", SCREEN_MODE_FM)
+        self.screen_mode_input.addItem("Гибридный", SCREEN_MODE_HYBRID)
+        self.screen_mode_input.currentIndexChanged.connect(lambda _index: self.render_preview())
+
+        self.screen_frequency_input = QSpinBox()
+        self.screen_frequency_input.setRange(20, 400)
+        self.screen_frequency_input.setSingleStep(5)
+        self.screen_frequency_input.setValue(DEFAULT_SCREEN_FREQUENCY)
+        self.screen_frequency_input.valueChanged.connect(lambda _value: self.render_preview())
+
         self.preview_label = QLabel("Предпросмотр появится после расчёта")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setMinimumSize(360, 260)
@@ -207,9 +232,13 @@ class MainWindow(QMainWindow):
         zoom_actions.addWidget(self.zoom_out_button)
         zoom_actions.addWidget(self.zoom_reset_button)
         zoom_actions.addWidget(self.zoom_in_button)
+        screen_form = QFormLayout()
+        screen_form.addRow("Растр", self.screen_mode_input)
+        screen_form.addRow("Линиатура, lpi", self.screen_frequency_input)
         preview_layout.addWidget(self.layer_list, 1)
         preview_layout.addLayout(layer_actions)
         preview_layout.addLayout(zoom_actions)
+        preview_layout.addLayout(screen_form)
         preview_layout.addWidget(self.preview_scroll, 3)
 
         result_splitter.addWidget(left_panel)
@@ -240,7 +269,7 @@ class MainWindow(QMainWindow):
                 left: 10px;
                 padding: 0 4px;
             }
-            QLineEdit, QSpinBox {
+            QLineEdit, QSpinBox, QComboBox {
                 min-height: 28px;
                 border: 1px solid #c8d0da;
                 border-radius: 4px;
@@ -370,6 +399,8 @@ class MainWindow(QMainWindow):
         self.zoom_out_button.setEnabled(not busy)
         self.zoom_reset_button.setEnabled(not busy)
         self.zoom_in_button.setEnabled(not busy)
+        self.screen_mode_input.setEnabled(not busy)
+        self.screen_frequency_input.setEnabled(not busy)
 
     def open_output_dir(self) -> None:
         if self.last_result:
@@ -392,9 +423,12 @@ class MainWindow(QMainWindow):
             if not plate.tiff_path or not plate.tiff_path.exists():
                 logger.warning("Preview layer skipped because TIFF is missing: %s", plate)
                 continue
-            layer = {"name": plate.name, "path": plate.tiff_path, "enabled": True}
+            screen_spec = result.screen_specs.get(plate.name)
+            frequency = screen_spec.frequency_lpi if screen_spec else None
+            angle = screen_spec.angle_deg if screen_spec else default_screen_angle(plate.name)
+            layer = {"name": plate.name, "path": plate.tiff_path, "enabled": True, "frequency_lpi": frequency, "angle_deg": angle}
             self.preview_layers.append(layer)
-            item = QListWidgetItem(plate.name)
+            item = QListWidgetItem(f"{plate.name}  {angle:g}°")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked)
             self.layer_list.addItem(item)
@@ -451,7 +485,12 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            preview = build_preview_image(enabled_layers)
+            preview = build_preview_image(
+                enabled_layers,
+                dpi=self.dpi_input.value(),
+                screen_mode=str(self.screen_mode_input.currentData()),
+                fallback_frequency_lpi=float(self.screen_frequency_input.value()),
+            )
         except Exception:
             logger.exception("Failed to render separation preview")
             self.preview_label.setText("Не удалось построить предпросмотр")
@@ -475,7 +514,9 @@ class MainWindow(QMainWindow):
         scaled = self.preview_pixmap.scaled(
             target_size,
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation
+            if self.screen_mode_input.currentData() != SCREEN_MODE_NONE
+            else Qt.TransformationMode.SmoothTransformation,
         )
         self.preview_label.setText("")
         self.preview_label.setPixmap(scaled)
@@ -495,7 +536,13 @@ def preview_ink_rgb(name: str) -> tuple[int, int, int]:
     return ((seed * 37) % 206 + 25, (seed * 67) % 206 + 25, (seed * 97) % 206 + 25)
 
 
-def build_preview_image(layers: list[dict[str, object]], max_size: int = 1200) -> Image.Image:
+def build_preview_image(
+    layers: list[dict[str, object]],
+    max_size: int = 1200,
+    dpi: int = DEFAULT_DPI,
+    screen_mode: str = SCREEN_MODE_NONE,
+    fallback_frequency_lpi: float = DEFAULT_SCREEN_FREQUENCY,
+) -> Image.Image:
     base_size: tuple[int, int] | None = None
     composite: np.ndarray | None = None
 
@@ -507,6 +554,17 @@ def build_preview_image(layers: list[dict[str, object]], max_size: int = 1200) -
             composite = np.full((base_size[1], base_size[0], 3), 255.0, dtype=np.float32)
         elif image.size != base_size:
             image = image.resize(base_size, Image.Resampling.LANCZOS)
+
+        if screen_mode == SCREEN_MODE_AM:
+            frequency_lpi = float(layer.get("frequency_lpi") or fallback_frequency_lpi)
+            angle_deg = float(layer.get("angle_deg") or default_screen_angle(str(layer["name"])))
+            image = apply_am_halftone(image, dpi=dpi, frequency_lpi=frequency_lpi, angle_deg=angle_deg)
+        elif screen_mode == SCREEN_MODE_FM:
+            image = apply_fm_halftone(image)
+        elif screen_mode == SCREEN_MODE_HYBRID:
+            frequency_lpi = float(layer.get("frequency_lpi") or fallback_frequency_lpi)
+            angle_deg = float(layer.get("angle_deg") or default_screen_angle(str(layer["name"])))
+            image = apply_hybrid_halftone(image, dpi=dpi, frequency_lpi=frequency_lpi, angle_deg=angle_deg)
 
         ink = (255.0 - np.asarray(image, dtype=np.float32)) / 255.0
         color = np.asarray(preview_ink_rgb(str(layer["name"])), dtype=np.float32) / 255.0

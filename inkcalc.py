@@ -14,6 +14,8 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
+from halftone import ScreenSpec, extract_postscript_screen_angles
+
 
 DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
@@ -38,6 +40,7 @@ class CoverageResult:
     source_paths: list[Path]
     output_dir: Path
     plates: list[PlateCoverage]
+    screen_specs: dict[str, ScreenSpec]
 
 
 ProgressCallback = Callable[[str], None]
@@ -329,11 +332,13 @@ def calculate_sources_coverage(
     counts: dict[str, int] = {}
     kinds: dict[str, str] = {}
     plate_paths: dict[str, Path] = {}
+    screen_specs: dict[str, ScreenSpec] = {}
     all_tiffs: list[Path] = []
     used_tiffs: set[Path] = set()
     rename_labels: dict[Path, str] = {}
 
     for index, source_path in enumerate(source_paths, start=1):
+        screen_specs.update(extract_postscript_screen_angles(source_path))
         if progress:
             progress(f"Генерация цветоделения {index}/{len(source_paths)}...")
         source_output_dir = output_dir if len(source_paths) == 1 else output_dir / f"{index:03d}_{source_path.stem}"
@@ -375,7 +380,13 @@ def calculate_sources_coverage(
         {plate.name: round(plate.percent, 4) for plate in plates},
         output_dir,
     )
-    return CoverageResult(pdf_path=source_paths[0], source_paths=source_paths, output_dir=output_dir, plates=plates)
+    return CoverageResult(
+        pdf_path=source_paths[0],
+        source_paths=source_paths,
+        output_dir=output_dir,
+        plates=plates,
+        screen_specs=screen_specs,
+    )
 
 
 def calculate_pdf_coverage(
