@@ -17,6 +17,11 @@ from PIL import Image
 from halftone import ScreenSpec, extract_postscript_screen_angles
 
 
+# Separation TIFFs are generated locally by Ghostscript and can legitimately
+# exceed Pillow's generic decompression-bomb limit at 1200-2400 DPI.
+Image.MAX_IMAGE_PIXELS = None
+
+
 DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
 SUPPORTED_INPUT_SUFFIXES = {".pdf", ".ps", ".eps"}
@@ -183,9 +188,10 @@ def tiff_sum_and_count_inverted(tiff_path: Path) -> tuple[int, int]:
     with Image.open(tiff_path) as image:
         if image.mode != "L":
             image = image.convert("L")
-        arr = np.asarray(image, dtype=np.uint8)
-    inverted = 255 - arr
-    return int(inverted.sum()), int(inverted.size)
+        histogram = image.histogram()
+        count = image.width * image.height
+    total = sum((255 - level) * pixels for level, pixels in enumerate(histogram))
+    return total, count
 
 
 def _validate_source_path(source_path: Path) -> None:

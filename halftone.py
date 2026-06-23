@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 import math
 import re
 from pathlib import Path
@@ -11,6 +12,8 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SCREEN_ANGLES = {
     "C": 15.0,
@@ -24,6 +27,7 @@ SCREEN_MODE_NONE = "none"
 SCREEN_MODE_AM = "am"
 SCREEN_MODE_FM = "fm"
 SCREEN_MODE_HYBRID = "hybrid"
+SCREEN_MODE_CODES = {SCREEN_MODE_AM: 1, SCREEN_MODE_FM: 2, SCREEN_MODE_HYBRID: 3}
 
 
 @dataclass(frozen=True)
@@ -60,7 +64,9 @@ def apply_am_halftone(image: Image.Image, dpi: int, frequency_lpi: float, angle_
     spot_threshold = _circular_spot_threshold(distance)
     dots = spot_threshold <= np.clip(ink, 0.0, 1.0)
     screened = np.where(dots, 0, 255).astype(np.uint8)
-    return Image.fromarray(screened, "L")
+    screened[arr == 0] = 0
+    screened[arr == 255] = 255
+    return Image.fromarray(screened)
 
 
 def apply_fm_halftone(image: Image.Image) -> Image.Image:
@@ -69,7 +75,9 @@ def apply_fm_halftone(image: Image.Image) -> Image.Image:
     ink = (255.0 - arr) / 255.0
     noise = _deterministic_noise(ink.shape)
     screened = np.where(noise < ink, 0, 255).astype(np.uint8)
-    return Image.fromarray(screened, "L")
+    screened[arr == 0] = 0
+    screened[arr == 255] = 255
+    return Image.fromarray(screened)
 
 
 def apply_hybrid_halftone(image: Image.Image, dpi: int, frequency_lpi: float, angle_deg: float) -> Image.Image:
@@ -80,7 +88,31 @@ def apply_hybrid_halftone(image: Image.Image, dpi: int, frequency_lpi: float, an
     fm = np.asarray(apply_fm_halftone(gray), dtype=np.uint8)
     use_fm = (ink < 0.20) | (ink > 0.85)
     screened = np.where(use_fm, fm, am).astype(np.uint8)
-    return Image.fromarray(screened, "L")
+    return Image.fromarray(screened)
+
+
+def apply_halftone(image: Image.Image, *, mode: str, dpi: int, frequency_lpi: float, angle_deg: float, prefer_gpu: bool = True) -> Image.Image:
+    gray = image.convert("L")
+    if mode == SCREEN_MODE_NONE:
+        return gray
+    mode_code = SCREEN_MODE_CODES.get(mode)
+    if mode_code is None:
+        raise ValueError(f"Unsupported halftone mode: {mode}")
+    if prefer_gpu:
+        try:
+            from gpu_halftone import get_opencl_backend
+            backend = get_opencl_backend()
+            if backend is not None:
+                source = np.asarray(gray, dtype=np.uint8)
+                screened = backend.apply(source, mode=mode_code, dpi=dpi, frequency_lpi=frequency_lpi, angle_deg=angle_deg)
+                return Image.fromarray(screened)
+        except Exception:
+            logger.exception("GPU halftone failed, falling back to CPU")
+    if mode == SCREEN_MODE_AM:
+        return apply_am_halftone(gray, dpi, frequency_lpi, angle_deg)
+    if mode == SCREEN_MODE_FM:
+        return apply_fm_halftone(gray)
+    return apply_hybrid_halftone(gray, dpi, frequency_lpi, angle_deg)
 
 
 def _deterministic_noise(shape: tuple[int, int]) -> np.ndarray:

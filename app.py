@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 from app_logging import setup_logging
@@ -60,11 +61,10 @@ try:
         SCREEN_MODE_FM,
         SCREEN_MODE_HYBRID,
         SCREEN_MODE_NONE,
-        apply_am_halftone,
-        apply_fm_halftone,
-        apply_hybrid_halftone,
+        apply_halftone,
         default_screen_angle,
     )
+    from gpu_halftone import compute_backend_name
 except Exception:
     logger.exception("Application startup failed while importing calculation modules")
     raise
@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
         self.screen_frequency_input.setSingleStep(5)
         self.screen_frequency_input.setValue(DEFAULT_SCREEN_FREQUENCY)
         self.screen_frequency_input.valueChanged.connect(lambda _value: self.render_preview())
+        self.compute_backend_label = QLabel(compute_backend_name())
 
         self.preview_label = QLabel("Предпросмотр появится после расчёта")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -235,6 +236,7 @@ class MainWindow(QMainWindow):
         screen_form = QFormLayout()
         screen_form.addRow("Растр", self.screen_mode_input)
         screen_form.addRow("Линиатура, lpi", self.screen_frequency_input)
+        screen_form.addRow("Вычисления", self.compute_backend_label)
         preview_layout.addWidget(self.layer_list, 1)
         preview_layout.addLayout(layer_actions)
         preview_layout.addLayout(zoom_actions)
@@ -547,24 +549,24 @@ def build_preview_image(
     composite: np.ndarray | None = None
 
     for layer in layers:
-        image = Image.open(Path(layer["path"])).convert("L")
+        layer_path = Path(layer["path"])
+        image = load_preview_layer(str(layer_path.resolve()), layer_path.stat().st_mtime_ns, max_size).copy()
         if base_size is None:
-            image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             base_size = image.size
             composite = np.full((base_size[1], base_size[0], 3), 255.0, dtype=np.float32)
         elif image.size != base_size:
             image = image.resize(base_size, Image.Resampling.LANCZOS)
 
-        if screen_mode == SCREEN_MODE_AM:
+        if screen_mode != SCREEN_MODE_NONE:
             frequency_lpi = float(layer.get("frequency_lpi") or fallback_frequency_lpi)
             angle_deg = float(layer.get("angle_deg") or default_screen_angle(str(layer["name"])))
-            image = apply_am_halftone(image, dpi=dpi, frequency_lpi=frequency_lpi, angle_deg=angle_deg)
-        elif screen_mode == SCREEN_MODE_FM:
-            image = apply_fm_halftone(image)
-        elif screen_mode == SCREEN_MODE_HYBRID:
-            frequency_lpi = float(layer.get("frequency_lpi") or fallback_frequency_lpi)
-            angle_deg = float(layer.get("angle_deg") or default_screen_angle(str(layer["name"])))
-            image = apply_hybrid_halftone(image, dpi=dpi, frequency_lpi=frequency_lpi, angle_deg=angle_deg)
+            image = apply_halftone(
+                image,
+                mode=screen_mode,
+                dpi=dpi,
+                frequency_lpi=frequency_lpi,
+                angle_deg=angle_deg,
+            )
 
         ink = (255.0 - np.asarray(image, dtype=np.float32)) / 255.0
         color = np.asarray(preview_ink_rgb(str(layer["name"])), dtype=np.float32) / 255.0
@@ -574,6 +576,15 @@ def build_preview_image(
     if composite is None:
         return Image.new("RGB", (600, 400), "white")
     return Image.fromarray(np.clip(composite, 0, 255).astype(np.uint8), "RGB")
+
+
+@lru_cache(maxsize=32)
+def load_preview_layer(path: str, modified_ns: int, max_size: int) -> Image.Image:
+    del modified_ns
+    with Image.open(path) as source:
+        image = source.convert("L")
+        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        return image.copy()
 
 
 def pil_image_to_qimage(image: Image.Image) -> QImage:
