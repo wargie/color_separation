@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 import re
@@ -55,11 +56,9 @@ def apply_am_halftone(image: Image.Image, dpi: int, frequency_lpi: float, angle_
 
     cell_x = ((rotated_x / cell_size) % 1.0) - 0.5
     cell_y = ((rotated_y / cell_size) % 1.0) - 0.5
-    distance = np.sqrt(cell_x * cell_x + cell_y * cell_y) / math.sqrt(0.5)
-
-    # A circular AM dot: ink coverage controls dot radius inside each screen cell.
-    threshold = np.sqrt(np.clip(ink, 0.0, 1.0))
-    dots = distance <= threshold
+    distance = np.sqrt(cell_x * cell_x + cell_y * cell_y)
+    spot_threshold = _circular_spot_threshold(distance)
+    dots = spot_threshold <= np.clip(ink, 0.0, 1.0)
     screened = np.where(dots, 0, 255).astype(np.uint8)
     return Image.fromarray(screened, "L")
 
@@ -93,40 +92,60 @@ def _deterministic_noise(shape: tuple[int, int]) -> np.ndarray:
     return value.astype(np.float32) / np.float32(2**32 - 1)
 
 
+def _circular_spot_threshold(distance: np.ndarray) -> np.ndarray:
+    radius_sq = distance * distance
+    threshold = np.empty(distance.shape, dtype=np.float32)
+    inner = distance <= 0.5
+    threshold[inner] = np.float32(math.pi) * radius_sq[inner]
+
+    outer = ~inner
+    outer_radius = distance[outer]
+    outer_radius_sq = radius_sq[outer]
+    segment = outer_radius_sq * np.arccos(0.5 / outer_radius)
+    segment -= 0.5 * np.sqrt(np.maximum(outer_radius_sq - 0.25, 0.0))
+    threshold[outer] = np.float32(math.pi) * outer_radius_sq - 4.0 * segment
+    return np.clip(threshold, 0.0, 1.0)
+
+
 def extract_postscript_screen_angles(source_path: Path) -> dict[str, ScreenSpec]:
     if source_path.suffix.lower() not in {".ps", ".eps"}:
         return {}
 
+    screens: dict[str, ScreenSpec] = {}
+    recent_lines: deque[str] = deque(maxlen=40)
     try:
-        text = source_path.read_text(encoding="latin-1", errors="replace")
+        with source_path.open("r", encoding="latin-1", errors="replace") as handle:
+            for line in handle:
+                recent_lines.append(line)
+                lower_line = line.lower()
+                if "setcolorscreen" in lower_line:
+                    screens.update(_extract_setcolorscreen("".join(recent_lines)))
+                if "sethalftone" in lower_line or "setscreen" in lower_line:
+                    screens.update(_extract_halftone_blocks("".join(recent_lines)))
     except OSError:
         return {}
-
-    screens: dict[str, ScreenSpec] = {}
-    screens.update(_extract_setcolorscreen(text))
-    screens.update(_extract_halftone_blocks(text))
     return screens
 
 
 def _extract_setcolorscreen(text: str) -> dict[str, ScreenSpec]:
     screens: dict[str, ScreenSpec] = {}
-    for match in re.finditer(r"(?P<body>.{0,1200}?)\bsetcolorscreen\b", text, re.IGNORECASE | re.DOTALL):
-        numbers = [float(value) for value in re.findall(r"[-+]?\d+(?:\.\d+)?", match.group("body"))]
-        if len(numbers) < 8:
-            continue
-        values = numbers[-8:]
-        for plate, offset in zip(("C", "M", "Y", "K"), range(0, 8, 2)):
-            frequency = values[offset]
-            angle = values[offset + 1]
-            if frequency > 0:
-                screens[plate] = ScreenSpec(frequency_lpi=frequency, angle_deg=angle)
+    before_operator = re.split(r"\bsetcolorscreen\b", text, flags=re.IGNORECASE)[0]
+    numbers = [float(value) for value in re.findall(r"[-+]?\d+(?:\.\d+)?", before_operator)]
+    if len(numbers) < 8:
+        return screens
+    values = numbers[-8:]
+    for plate, offset in zip(("C", "M", "Y", "K"), range(0, 8, 2)):
+        frequency = values[offset]
+        angle = values[offset + 1]
+        if frequency > 0:
+            screens[plate] = ScreenSpec(frequency_lpi=frequency, angle_deg=angle)
     return screens
 
 
 def _extract_halftone_blocks(text: str) -> dict[str, ScreenSpec]:
     screens: dict[str, ScreenSpec] = {}
     block_pattern = re.compile(
-        r"/(?P<plate>Cyan|Magenta|Yellow|Black|C|M|Y|K)\b(?P<body>.{0,800}?)(?:sethalftone|setscreen)",
+        r"/(?P<plate>Cyan|Magenta|Yellow|Black|C|M|Y|K)\b(?P<body>.{0,4000}?)(?:sethalftone|setscreen)",
         re.IGNORECASE | re.DOTALL,
     )
     for match in block_pattern.finditer(text):
