@@ -74,6 +74,9 @@ __kernel void halftone(
     }
 
     float ink = (255.0f - convert_float(source)) / 255.0f;
+    if (mode == 4 && ink > 0.0f && ink < 0.02f) {
+        ink = 0.02f;
+    }
     float noise = random_threshold((uint)x, (uint)y);
     int use_fm = mode == 2 || (mode == 3 && (ink < 0.20f || ink > 0.85f));
 

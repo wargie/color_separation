@@ -103,6 +103,39 @@ class HalftoneTests(unittest.TestCase):
         self.assertAlmostEqual(halftone_cell_size(160.952, 150.0), 1.0730133333)
         self.assertEqual(halftone_cell_size(100.0, 150.0), 1.0)
 
+
+    def test_flexo_mode_holds_minimum_highlight_dot(self) -> None:
+        source = np.full((256, 256), 251, dtype=np.uint8)
+        output = np.asarray(
+            apply_halftone(
+                Image.fromarray(source),
+                mode="flexo",
+                dpi=2400,
+                frequency_lpi=150,
+                angle_deg=45,
+                prefer_gpu=False,
+            )
+        )
+        measured_ink = np.mean((255.0 - output.astype(np.float32)) / 255.0)
+        self.assertGreater(float(measured_ink), 0.01)
+
+    def test_error_diffusion_preserves_paper_and_solids(self) -> None:
+        source = np.full((64, 64), 128, dtype=np.uint8)
+        source[:8] = 254
+        source[-8:] = 2
+        output = np.asarray(
+            apply_halftone(
+                Image.fromarray(source),
+                mode="error_diffusion",
+                dpi=600,
+                frequency_lpi=150,
+                angle_deg=45,
+                prefer_gpu=False,
+            )
+        )
+        self.assertTrue(np.all(output[:8] == 255))
+        self.assertTrue(np.all(output[-8:] == 0))
+
     def test_am_preserves_requested_coverage(self) -> None:
         image = Image.fromarray(np.full((800, 800), 128, dtype=np.uint8))
         output = np.asarray(

@@ -27,7 +27,9 @@ SCREEN_MODE_NONE = "none"
 SCREEN_MODE_AM = "am"
 SCREEN_MODE_FM = "fm"
 SCREEN_MODE_HYBRID = "hybrid"
-SCREEN_MODE_CODES = {SCREEN_MODE_AM: 1, SCREEN_MODE_FM: 2, SCREEN_MODE_HYBRID: 3}
+SCREEN_MODE_FLEXO = "flexo"
+SCREEN_MODE_ERROR_DIFFUSION = "error_diffusion"
+SCREEN_MODE_CODES = {SCREEN_MODE_AM: 1, SCREEN_MODE_FM: 2, SCREEN_MODE_HYBRID: 3, SCREEN_MODE_FLEXO: 4}
 SPOT_SHAPE_CODES = {"circle": 0, "ellipse": 1, "square": 2, "line": 3}
 PAPER_VALUE_THRESHOLD = 252
 SOLID_INK_VALUE_THRESHOLD = 3
@@ -55,6 +57,7 @@ def apply_am_halftone(
     frequency_lpi: float,
     angle_deg: float,
     spot_shape: str = "circle",
+    minimum_dot: float = 0.0,
 ) -> Image.Image:
     gray = image.convert("L")
     arr = np.asarray(gray, dtype=np.float32)
@@ -77,6 +80,8 @@ def apply_am_halftone(
     cell_y = ((rotated_y / cell_size) % 1.0) - 0.5
     spot_threshold = _spot_threshold(cell_x, cell_y, spot_shape)
     ink = np.clip(ink, 0.0, 1.0)
+    if minimum_dot > 0:
+        ink = np.where((ink > 0.0) & (ink < minimum_dot), minimum_dot, ink)
     edge_width = np.float32(np.clip(0.75 / cell_size, 0.015, 0.12))
     dot_alpha = np.clip((ink - spot_threshold) / edge_width + 0.5, 0.0, 1.0)
     screened = np.rint(255.0 * (1.0 - dot_alpha)).astype(np.uint8)
@@ -111,6 +116,36 @@ def apply_hybrid_halftone(
     return Image.fromarray(screened)
 
 
+
+def apply_error_diffusion_halftone(image: Image.Image) -> Image.Image:
+    gray = image.convert("L")
+    source = np.asarray(gray, dtype=np.float32)
+    work = source.copy()
+    height, width = work.shape
+    output = np.empty((height, width), dtype=np.uint8)
+
+    for y in range(height):
+        left_to_right = y % 2 == 0
+        x_range = range(width) if left_to_right else range(width - 1, -1, -1)
+        for x in x_range:
+            old = work[y, x]
+            new = 0.0 if old < 128.0 else 255.0
+            output[y, x] = np.uint8(new)
+            error = old - new
+            direction = 1 if left_to_right else -1
+            nx = x + direction
+            if 0 <= nx < width:
+                work[y, nx] += error * 7.0 / 16.0
+            if y + 1 < height:
+                if 0 <= x - direction < width:
+                    work[y + 1, x - direction] += error * 3.0 / 16.0
+                work[y + 1, x] += error * 5.0 / 16.0
+                if 0 <= nx < width:
+                    work[y + 1, nx] += error * 1.0 / 16.0
+
+    _preserve_paper_and_solids(output, source)
+    return Image.fromarray(output)
+
 def apply_halftone(
     image: Image.Image,
     *,
@@ -125,6 +160,8 @@ def apply_halftone(
     if mode == SCREEN_MODE_NONE:
         return gray
     mode_code = SCREEN_MODE_CODES.get(mode)
+    if mode == SCREEN_MODE_ERROR_DIFFUSION:
+        return apply_error_diffusion_halftone(gray)
     if mode_code is None:
         raise ValueError(f"Unsupported halftone mode: {mode}")
     if prefer_gpu:
@@ -146,6 +183,8 @@ def apply_halftone(
             logger.exception("GPU halftone failed, falling back to CPU")
     if mode == SCREEN_MODE_AM:
         return apply_am_halftone(gray, dpi, frequency_lpi, angle_deg, spot_shape)
+    if mode == SCREEN_MODE_FLEXO:
+        return apply_am_halftone(gray, dpi, frequency_lpi, angle_deg, spot_shape, minimum_dot=0.02)
     if mode == SCREEN_MODE_FM:
         return apply_fm_halftone(gray)
     return apply_hybrid_halftone(gray, dpi, frequency_lpi, angle_deg, spot_shape)

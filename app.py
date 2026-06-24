@@ -63,6 +63,8 @@ try:
         SCREEN_MODE_AM,
         SCREEN_MODE_FM,
         SCREEN_MODE_HYBRID,
+        SCREEN_MODE_FLEXO,
+        SCREEN_MODE_ERROR_DIFFUSION,
         SCREEN_MODE_NONE,
         default_screen_angle,
     )
@@ -164,9 +166,11 @@ class MainWindow(QMainWindow):
 
         self.screen_mode_input = QComboBox()
         self.screen_mode_input.addItem("Без растра", SCREEN_MODE_NONE)
-        self.screen_mode_input.addItem("Традиционный AM", SCREEN_MODE_AM)
+        self.screen_mode_input.addItem("Офсетный AM", SCREEN_MODE_AM)
+        self.screen_mode_input.addItem("Флексо AM", SCREEN_MODE_FLEXO)
         self.screen_mode_input.addItem("Стохастика FM", SCREEN_MODE_FM)
-        self.screen_mode_input.addItem("Гибридный", SCREEN_MODE_HYBRID)
+        self.screen_mode_input.addItem("Error diffusion", SCREEN_MODE_ERROR_DIFFUSION)
+        self.screen_mode_input.addItem("Гибридный XM", SCREEN_MODE_HYBRID)
         self.screen_mode_input.currentIndexChanged.connect(lambda _index: self.render_preview())
 
         self.profile_input = QComboBox()
@@ -886,7 +890,7 @@ def preview_ink_rgb(name: str) -> tuple[int, int, int]:
 
 def build_preview_image(
     layers: list[dict[str, object]],
-    max_size: int = 3200,
+    max_size: int = 8192,
     dpi: int = DEFAULT_DPI,
     screen_mode: str = SCREEN_MODE_NONE,
     fallback_frequency_lpi: float = DEFAULT_SCREEN_FREQUENCY,

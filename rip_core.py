@@ -15,7 +15,7 @@ from PIL import Image
 
 from halftone import DEFAULT_SCREEN_FREQUENCY, SCREEN_MODE_NONE, apply_halftone, default_screen_angle
 from inkcalc import DEFAULT_DPI
-from plate_bits import is_prescreened_plate
+from plate_bits import is_bitonal_plate
 
 
 logger = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ class RenderLayer:
 @dataclass(frozen=True)
 class TileRenderRequest:
     layers: tuple[RenderLayer, ...]
-    max_size: int = 3200
+    max_size: int = 8192
     dpi: float = DEFAULT_DPI
     screen_mode: str = SCREEN_MODE_NONE
     fallback_frequency_lpi: float = DEFAULT_SCREEN_FREQUENCY
@@ -90,7 +90,7 @@ def render_preview(
     layers: Iterable[RenderLayer],
     *,
     color_resolver: ColorResolver,
-    max_size: int = 3200,
+    max_size: int = 8192,
     dpi: float = DEFAULT_DPI,
     screen_mode: str = SCREEN_MODE_NONE,
     fallback_frequency_lpi: float = DEFAULT_SCREEN_FREQUENCY,
@@ -116,7 +116,7 @@ def _render_preview_python(request: TileRenderRequest, color_resolver: ColorReso
     try:
         for layer in request.layers:
             image = Image.open(layer.path)
-            opened.append((layer, image, image.size, is_prescreened_plate(image)))
+            opened.append((layer, image, image.size, is_bitonal_plate(image)))
 
         base_width, base_height = opened[0][2]
         scale = min(1.0, request.max_size / base_width, request.max_size / base_height)
@@ -170,13 +170,13 @@ def _render_tile_python(
     )
     base_width, base_height = base_size
 
-    for layer, image, source_size, prescreened in opened_layers:
+    for layer, image, source_size, bitonal in opened_layers:
         source_box = _map_source_box(base_source_box, base_size, source_size)
         gray = image.convert("L").crop(source_box)
         if gray.size != (tile_width, tile_height):
             gray = gray.resize((tile_width, tile_height), Image.Resampling.LANCZOS)
 
-        if screen_mode != SCREEN_MODE_NONE and not prescreened:
+        if screen_mode != SCREEN_MODE_NONE and not bitonal:
             frequency = layer.frequency_lpi or fallback_frequency_lpi
             angle = layer.angle_deg if layer.angle_deg is not None else default_screen_angle(layer.name)
             gray = apply_halftone(
