@@ -15,6 +15,7 @@ import numpy as np
 from PIL import Image
 
 from halftone import ScreenSpec, extract_postscript_screen_angles
+from plate_bits import save_bitonal_plate
 
 
 # Separation TIFFs are generated locally by Ghostscript and can legitimately
@@ -306,6 +307,21 @@ def rename_used_tiffs(rename_labels: dict[Path, str]) -> dict[Path, Path]:
     return renamed_paths
 
 
+def normalize_plate_bitmasks(plate_paths: dict[str, Path]) -> dict[str, Path]:
+    normalized = dict(plate_paths)
+    for label, path in list(plate_paths.items()):
+        if not path or not path.exists():
+            continue
+        try:
+            bitonal_path = save_bitonal_plate(path, label)
+        except Exception:
+            logger.exception("Failed to create bitonal plate mask: %s", path)
+            continue
+        if bitonal_path is not None:
+            normalized[label] = bitonal_path
+    return normalized
+
+
 def calculate_sources_coverage(
     source_paths: list[Path],
     dpi: int = DEFAULT_DPI,
@@ -367,6 +383,7 @@ def calculate_sources_coverage(
     cleanup_unused_tiffs(all_tiffs, used_tiffs)
     renamed_paths = rename_used_tiffs(rename_labels)
     plate_paths = {label: renamed_paths.get(path, path) for label, path in plate_paths.items()}
+    plate_paths = normalize_plate_bitmasks(plate_paths)
 
     order = {"C": 0, "M": 1, "Y": 2, "K": 3}
     labels = sorted(sums, key=lambda value: (order.get(value, 100), value.lower()))

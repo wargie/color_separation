@@ -7,6 +7,8 @@ from threading import Lock
 
 import numpy as np
 
+from halftone import halftone_cell_size
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,18 @@ float random_threshold(uint x, uint y) {
     value = value ^ (value >> 16u);
     return convert_float(value) / 4294967295.0f;
 }
+float shape_threshold(float cell_x, float cell_y, int spot_shape) {
+    if (spot_shape == 2) {
+        float extent = fmax(fabs(cell_x), fabs(cell_y));
+        return clamp(4.0f * extent * extent, 0.0f, 1.0f);
+    }
+    if (spot_shape == 3) {
+        return clamp(2.0f * fabs(cell_y), 0.0f, 1.0f);
+    }
+    float shape_x = spot_shape == 1 ? cell_x * 0.75f : cell_x;
+    float shape_y = spot_shape == 1 ? cell_y / 0.75f : cell_y;
+    return spot_threshold(sqrt(shape_x * shape_x + shape_y * shape_y));
+}
 
 __kernel void halftone(
     __global const uchar *gray,
@@ -37,7 +51,8 @@ __kernel void halftone(
     const int height,
     const float cell_size,
     const float angle_rad,
-    const int mode
+    const int mode,
+    const int spot_shape
 ) {
     int x = get_global_id(0);
     int y = get_global_id(1);
@@ -48,12 +63,12 @@ __kernel void halftone(
     int index = y * width + x;
     uchar source = gray[index];
 
-    // Preserve paper and 100% solids. Screening is only applied to halftones.
-    if (source == (uchar)255) {
+    // Preserve paper and 100% solids, including tiny conversion noise.
+    if (source >= (uchar)252) {
         output[index] = (uchar)255;
         return;
     }
-    if (source == (uchar)0) {
+    if (source <= (uchar)3) {
         output[index] = (uchar)0;
         return;
     }
@@ -75,8 +90,10 @@ __kernel void halftone(
     float cell_y = rotated_y / cell_size;
     cell_x = cell_x - floor(cell_x) - 0.5f;
     cell_y = cell_y - floor(cell_y) - 0.5f;
-    float distance = sqrt(cell_x * cell_x + cell_y * cell_y);
-    output[index] = spot_threshold(distance) <= ink ? (uchar)0 : (uchar)255;
+    float threshold = shape_threshold(cell_x, cell_y, spot_shape);
+    float edge_width = clamp(0.75f / cell_size, 0.015f, 0.12f);
+    float dot_alpha = clamp((ink - threshold) / edge_width + 0.5f, 0.0f, 1.0f);
+    output[index] = convert_uchar_sat_rte(255.0f * (1.0f - dot_alpha));
 }
 """
 
@@ -108,14 +125,15 @@ class OpenCLHalftoneBackend:
         gray: np.ndarray,
         *,
         mode: int,
-        dpi: int,
+        dpi: float,
         frequency_lpi: float,
         angle_deg: float,
+        spot_shape: int = 0,
     ) -> np.ndarray:
         source = np.ascontiguousarray(gray, dtype=np.uint8)
         output = np.empty_like(source)
         height, width = source.shape
-        cell_size = max(2.0, float(dpi) / float(frequency_lpi))
+        cell_size = halftone_cell_size(dpi, frequency_lpi)
 
         cl = self.cl
         flags = cl.mem_flags
@@ -134,6 +152,7 @@ class OpenCLHalftoneBackend:
                 np.float32(cell_size),
                 np.float32(np.deg2rad(angle_deg)),
                 np.int32(mode),
+                np.int32(spot_shape),
             )
             cl.enqueue_nd_range_kernel(self.queue, self.kernel, (width, height), None)
             cl.enqueue_copy(self.queue, output, output_buffer).wait()
@@ -165,4 +184,3 @@ def get_opencl_backend() -> OpenCLHalftoneBackend | None:
 def compute_backend_name() -> str:
     backend = get_opencl_backend()
     return backend.name if backend else "CPU NumPy"
-

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import sys
-from functools import lru_cache
 from pathlib import Path
 
 from app_logging import setup_logging
@@ -22,8 +21,8 @@ except Exception:
     raise
 
 try:
-    from PySide6.QtCore import QObject, Qt, QThread, QUrl, Signal
-    from PySide6.QtGui import QDesktopServices, QFont, QImage, QPixmap
+    from PySide6.QtCore import QObject, QSize, Qt, QThread, QUrl, Signal
+    from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QImage, QPixmap, QTransform
     from PySide6.QtWidgets import (
         QApplication,
         QComboBox,
@@ -42,10 +41,14 @@ try:
         QMessageBox,
         QPushButton,
         QScrollArea,
+        QSlider,
         QSplitter,
         QSpinBox,
+        QStyle,
         QTableWidget,
         QTableWidgetItem,
+        QToolBar,
+        QToolButton,
         QVBoxLayout,
         QWidget,
     )
@@ -61,10 +64,11 @@ try:
         SCREEN_MODE_FM,
         SCREEN_MODE_HYBRID,
         SCREEN_MODE_NONE,
-        apply_halftone,
         default_screen_angle,
     )
     from gpu_halftone import compute_backend_name
+    from ppd_profiles import PpdProfile, discover_ppd_profiles, parse_ppd
+    from rip_core import layers_from_dicts, render_preview
 except Exception:
     logger.exception("Application startup failed while importing calculation modules")
     raise
@@ -101,8 +105,8 @@ class CalculationWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Калькулятор покрытия краской")
-        self.resize(820, 520)
+        self.setWindowTitle("Color Separation Workstation")
+        self.resize(1280, 800)
 
         self.thread: QThread | None = None
         self.worker: CalculationWorker | None = None
@@ -110,6 +114,9 @@ class MainWindow(QMainWindow):
         self.preview_layers: list[dict[str, object]] = []
         self.preview_zoom = 1.0
         self.preview_pixmap: QPixmap | None = None
+        self.preview_rotation = 0
+        self.ppd_profiles = discover_ppd_profiles(Path(__file__).resolve().parent)
+        self.profile_sync_in_progress = False
 
         self.source_input = QLineEdit()
         self.source_input.setPlaceholderText("Выберите PDF, PS или EPS. Для нескольких файлов используйте кнопку Обзор...")
@@ -121,13 +128,13 @@ class MainWindow(QMainWindow):
 
         self.output_input = QLineEdit(str(DEFAULT_OUTPUT_ROOT))
         self.dpi_input = QSpinBox()
-        self.dpi_input.setRange(72, 2400)
+        self.dpi_input.setRange(72, 4800)
         self.dpi_input.setSingleStep(50)
         self.dpi_input.setValue(DEFAULT_DPI)
 
         self.status_label = QLabel("Готово")
         self.status_label.setFrameShape(QFrame.Shape.StyledPanel)
-        self.status_label.setMinimumHeight(32)
+        self.status_label.setMinimumHeight(24)
 
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Канал", "Покрытие, %"])
@@ -139,10 +146,13 @@ class MainWindow(QMainWindow):
 
         self.layer_list = QListWidget()
         self.layer_list.itemChanged.connect(self.on_layer_changed)
+        self.layer_list.setMinimumHeight(150)
 
-        self.move_layer_up_button = QPushButton("Вверх")
+        self.move_layer_up_button = QPushButton("▲")
+        self.move_layer_up_button.setToolTip("Поднять канал")
         self.move_layer_up_button.clicked.connect(self.move_selected_layer_up)
-        self.move_layer_down_button = QPushButton("Вниз")
+        self.move_layer_down_button = QPushButton("▼")
+        self.move_layer_down_button.setToolTip("Опустить канал")
         self.move_layer_down_button.clicked.connect(self.move_selected_layer_down)
 
         self.zoom_out_button = QPushButton("-")
@@ -159,22 +169,38 @@ class MainWindow(QMainWindow):
         self.screen_mode_input.addItem("Гибридный", SCREEN_MODE_HYBRID)
         self.screen_mode_input.currentIndexChanged.connect(lambda _index: self.render_preview())
 
+        self.profile_input = QComboBox()
+        self.profile_input.addItem("Вручную", None)
+        for profile in self.ppd_profiles:
+            self.profile_input.addItem(profile.name, profile)
+        self.profile_input.currentIndexChanged.connect(self.on_profile_changed)
+
+        self.load_profile_button = QPushButton("…")
+        self.load_profile_button.setToolTip("Загрузить PPD")
+        self.load_profile_button.clicked.connect(self.choose_ppd_profile)
+
+        self.spot_shape_input = QComboBox()
+        self._set_default_spot_shapes()
+        self.spot_shape_input.currentIndexChanged.connect(lambda _index: self.render_preview())
+
         self.screen_frequency_input = QSpinBox()
         self.screen_frequency_input.setRange(20, 400)
         self.screen_frequency_input.setSingleStep(5)
         self.screen_frequency_input.setValue(DEFAULT_SCREEN_FREQUENCY)
-        self.screen_frequency_input.valueChanged.connect(lambda _value: self.render_preview())
+        self.screen_frequency_input.valueChanged.connect(self.on_screen_settings_changed)
+        self.dpi_input.valueChanged.connect(self.on_screen_settings_changed)
         self.compute_backend_label = QLabel(compute_backend_name())
 
         self.preview_label = QLabel("Предпросмотр появится после расчёта")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumSize(360, 260)
+        self.preview_label.setMinimumSize(640, 480)
         self.preview_label.setFrameShape(QFrame.Shape.StyledPanel)
         self.preview_label.setStyleSheet("background: #ffffff;")
 
         self.preview_scroll = QScrollArea()
         self.preview_scroll.setWidgetResizable(False)
         self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_scroll.setObjectName("canvasScroll")
         self.preview_scroll.setWidget(self.preview_label)
 
         self.calculate_button = QPushButton("Рассчитать")
@@ -185,119 +211,353 @@ class MainWindow(QMainWindow):
         self.open_output_button.clicked.connect(self.open_output_dir)
 
         self._build_layout()
+        self._build_toolbar()
         self._apply_style()
         logger.info("Main window initialized")
 
     def _build_layout(self) -> None:
         root = QWidget()
-        layout = QVBoxLayout(root)
+        root.setObjectName("workspaceRoot")
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        file_group = QGroupBox("Файл и параметры")
-        file_layout = QGridLayout(file_group)
+        workspace = QSplitter(Qt.Orientation.Horizontal)
+        workspace.setHandleWidth(1)
 
-        browse_source_button = QPushButton("Обзор...")
-        browse_source_button.clicked.connect(self.choose_sources)
-        browse_output_button = QPushButton("Обзор...")
-        browse_output_button.clicked.connect(self.choose_output_root)
+        canvas_panel = QWidget()
+        canvas_panel.setObjectName("canvasPanel")
+        canvas_layout = QVBoxLayout(canvas_panel)
+        canvas_layout.setContentsMargins(0, 0, 0, 0)
+        canvas_layout.setSpacing(0)
+        canvas_layout.addWidget(self.preview_scroll, 1)
 
-        file_layout.addWidget(QLabel("Файлы"), 0, 0)
-        file_layout.addWidget(self.source_input, 0, 1)
-        file_layout.addWidget(browse_source_button, 0, 2)
-        file_layout.addWidget(QLabel("Папка вывода"), 1, 0)
-        file_layout.addWidget(self.output_input, 1, 1)
-        file_layout.addWidget(browse_output_button, 1, 2)
+        right_scroll = QScrollArea()
+        right_scroll.setObjectName("inspectorScroll")
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        right_panel = QWidget()
+        right_panel.setObjectName("inspectorPanel")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(6, 6, 6, 8)
+        right_layout.setSpacing(6)
 
-        dpi_form = QFormLayout()
-        dpi_form.addRow("DPI", self.dpi_input)
-        file_layout.addLayout(dpi_form, 2, 1)
+        navigator_group = QGroupBox("Навигатор")
+        navigator_layout = QVBoxLayout(navigator_group)
+        navigator_layout.setContentsMargins(6, 8, 6, 6)
+        self.navigator_label = QLabel("Нет документа")
+        self.navigator_label.setObjectName("navigatorPreview")
+        self.navigator_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.navigator_label.setFixedHeight(150)
+        navigator_layout.addWidget(self.navigator_label)
+        navigator_zoom = QHBoxLayout()
+        self.navigator_zoom_out = self._icon_button("−", "Уменьшить", self.zoom_out_preview)
+        self.navigator_zoom_in = self._icon_button("+", "Увеличить", self.zoom_in_preview)
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(10, 600)
+        self.zoom_slider.setValue(100)
+        self.zoom_slider.valueChanged.connect(lambda value: self.set_preview_zoom(value / 100.0, sync_slider=False))
+        self.zoom_percent_label = QLabel("100%")
+        self.zoom_percent_label.setFixedWidth(44)
+        self.zoom_percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        navigator_zoom.addWidget(self.navigator_zoom_out)
+        navigator_zoom.addWidget(self.zoom_slider, 1)
+        navigator_zoom.addWidget(self.navigator_zoom_in)
+        navigator_zoom.addWidget(self.zoom_percent_label)
+        navigator_layout.addLayout(navigator_zoom)
 
-        actions = QHBoxLayout()
-        actions.addStretch(1)
-        actions.addWidget(self.open_output_button)
-        actions.addWidget(self.calculate_button)
+        view_group = QGroupBox("Вид")
+        view_layout = QHBoxLayout(view_group)
+        view_layout.setContentsMargins(6, 8, 6, 6)
+        view_layout.addWidget(self._icon_button("□", "Вписать страницу", self.fit_preview))
+        view_layout.addWidget(self._icon_button("1:1", "Масштаб 100%", self.reset_preview_zoom))
+        view_layout.addWidget(self._icon_button("↶", "Повернуть влево", self.rotate_preview_left))
+        view_layout.addWidget(self._icon_button("↷", "Повернуть вправо", self.rotate_preview_right))
+        view_layout.addStretch(1)
 
-        layout.addWidget(file_group)
+        channels_group = QGroupBox("Каналы")
+        channels_layout = QVBoxLayout(channels_group)
+        channels_layout.setContentsMargins(6, 8, 6, 6)
+        channel_tools = QHBoxLayout()
+        channel_tools.addWidget(self.move_layer_up_button)
+        channel_tools.addWidget(self.move_layer_down_button)
+        channel_tools.addStretch(1)
+        channels_layout.addLayout(channel_tools)
+        channels_layout.addWidget(self.layer_list)
 
-        result_splitter = QSplitter(Qt.Orientation.Horizontal)
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.addWidget(self.table, 1)
+        screening_group = QGroupBox("Растрирование")
+        screening_form = QFormLayout(screening_group)
+        screening_form.setContentsMargins(6, 10, 6, 6)
+        screening_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(self.profile_input, 1)
+        profile_row.addWidget(self.load_profile_button)
+        screening_form.addRow("Профиль", profile_row)
+        screening_form.addRow("Алгоритм", self.screen_mode_input)
+        screening_form.addRow("Точка", self.spot_shape_input)
+        screening_form.addRow("Линиатура", self.screen_frequency_input)
+        screening_form.addRow("DPI", self.dpi_input)
+        screening_form.addRow("Backend", self.compute_backend_label)
 
-        preview_group = QGroupBox("Просмотр цветоделения")
-        preview_layout = QVBoxLayout(preview_group)
-        layer_actions = QHBoxLayout()
-        layer_actions.addWidget(self.move_layer_up_button)
-        layer_actions.addWidget(self.move_layer_down_button)
-        zoom_actions = QHBoxLayout()
-        zoom_actions.addWidget(self.zoom_out_button)
-        zoom_actions.addWidget(self.zoom_reset_button)
-        zoom_actions.addWidget(self.zoom_in_button)
-        screen_form = QFormLayout()
-        screen_form.addRow("Растр", self.screen_mode_input)
-        screen_form.addRow("Линиатура, lpi", self.screen_frequency_input)
-        screen_form.addRow("Вычисления", self.compute_backend_label)
-        preview_layout.addWidget(self.layer_list, 1)
-        preview_layout.addLayout(layer_actions)
-        preview_layout.addLayout(zoom_actions)
-        preview_layout.addLayout(screen_form)
-        preview_layout.addWidget(self.preview_scroll, 3)
+        job_group = QGroupBox("Задание")
+        job_layout = QGridLayout(job_group)
+        job_layout.setContentsMargins(6, 10, 6, 6)
+        browse_source_button = self._icon_button("…", "Выбрать PDF, PS или EPS", self.choose_sources)
+        browse_output_button = self._icon_button("…", "Выбрать папку вывода", self.choose_output_root)
+        job_layout.addWidget(QLabel("Файл"), 0, 0)
+        job_layout.addWidget(self.source_input, 0, 1)
+        job_layout.addWidget(browse_source_button, 0, 2)
+        job_layout.addWidget(QLabel("Вывод"), 1, 0)
+        job_layout.addWidget(self.output_input, 1, 1)
+        job_layout.addWidget(browse_output_button, 1, 2)
+        job_actions = QHBoxLayout()
+        job_actions.addWidget(self.open_output_button)
+        job_actions.addStretch(1)
+        job_actions.addWidget(self.calculate_button)
+        job_layout.addLayout(job_actions, 2, 0, 1, 3)
 
-        result_splitter.addWidget(left_panel)
-        result_splitter.addWidget(preview_group)
-        result_splitter.setStretchFactor(0, 2)
-        result_splitter.setStretchFactor(1, 3)
+        coverage_group = QGroupBox("Покрытие")
+        coverage_layout = QVBoxLayout(coverage_group)
+        coverage_layout.setContentsMargins(4, 8, 4, 4)
+        self.table.setMinimumHeight(130)
+        coverage_layout.addWidget(self.table)
 
-        layout.addWidget(result_splitter, 1)
-        layout.addWidget(self.status_label)
-        layout.addLayout(actions)
+        info_group = QGroupBox("Информация")
+        info_layout = QVBoxLayout(info_group)
+        info_layout.setContentsMargins(8, 10, 8, 8)
+        self.document_info_label = QLabel("Документ не рассчитан")
+        self.document_info_label.setWordWrap(True)
+        info_layout.addWidget(self.document_info_label)
+
+        right_layout.addWidget(navigator_group)
+        right_layout.addWidget(view_group)
+        right_layout.addWidget(channels_group)
+        right_layout.addWidget(screening_group)
+        right_layout.addWidget(job_group)
+        right_layout.addWidget(coverage_group)
+        right_layout.addWidget(info_group)
+        right_layout.addStretch(1)
+        right_scroll.setWidget(right_panel)
+
+        workspace.addWidget(canvas_panel)
+        workspace.addWidget(right_scroll)
+        workspace.setStretchFactor(0, 1)
+        workspace.setStretchFactor(1, 0)
+        workspace.setSizes([1100, 330])
+        right_scroll.setMinimumWidth(310)
+        right_scroll.setMaximumWidth(390)
+
+        root_layout.addWidget(workspace, 1)
+        root_layout.addWidget(self.status_label)
         self.setCentralWidget(root)
 
+    def _build_toolbar(self) -> None:
+        toolbar = QToolBar("Инструменты", self)
+        toolbar.setObjectName("mainToolbar")
+        toolbar.setMovable(False)
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+
+        style = self.style()
+        actions = (
+            (QStyle.StandardPixmap.SP_DialogOpenButton, "Открыть файл", self.choose_sources),
+            (QStyle.StandardPixmap.SP_MediaPlay, "Рассчитать", self.start_calculation),
+            (None, None, None),
+            (QStyle.StandardPixmap.SP_ArrowDown, "Уменьшить", self.zoom_out_preview),
+            (QStyle.StandardPixmap.SP_ArrowUp, "Увеличить", self.zoom_in_preview),
+            (QStyle.StandardPixmap.SP_BrowserReload, "Вписать страницу", self.fit_preview),
+            (None, None, None),
+            (QStyle.StandardPixmap.SP_ArrowBack, "Повернуть влево", self.rotate_preview_left),
+            (QStyle.StandardPixmap.SP_ArrowForward, "Повернуть вправо", self.rotate_preview_right),
+            (None, None, None),
+            (QStyle.StandardPixmap.SP_DialogApplyButton, "Открыть папку вывода", self.open_output_dir),
+        )
+        for icon_id, tooltip, callback in actions:
+            if icon_id is None:
+                toolbar.addSeparator()
+                continue
+            action = QAction(style.standardIcon(icon_id), tooltip, self)
+            action.setToolTip(tooltip)
+            action.triggered.connect(callback)
+            toolbar.addAction(action)
+
+    def _icon_button(self, text: str, tooltip: str, callback: object) -> QToolButton:
+        button = QToolButton()
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setFixedSize(28, 26)
+        button.clicked.connect(callback)
+        return button
     def _apply_style(self) -> None:
-        app_font = QFont("Segoe UI", 10)
-        self.setFont(app_font)
+        self.setFont(QFont("Segoe UI", 9))
         self.setStyleSheet(
             """
-            QMainWindow { background: #f4f6f8; }
+            QMainWindow, #workspaceRoot { background: #ececec; }
+            QToolBar#mainToolbar {
+                background: #f7f7f7;
+                border: 0;
+                border-bottom: 1px solid #b9b9b9;
+                spacing: 2px;
+                padding: 3px 6px;
+            }
+            QToolBar#mainToolbar QToolButton {
+                width: 28px;
+                height: 26px;
+                border: 1px solid transparent;
+                border-radius: 2px;
+                padding: 1px;
+            }
+            QToolBar#mainToolbar QToolButton:hover { background: #e2edf6; border-color: #9cb8ce; }
+            #canvasPanel, QScrollArea#canvasScroll, QScrollArea#canvasScroll > QWidget > QWidget {
+                background: #55585b;
+                border: 0;
+            }
+            QLabel#canvasImage { background: #ffffff; border: 1px solid #8d8d8d; }
+            QScrollArea#inspectorScroll { background: #efefef; border: 0; border-left: 1px solid #b8b8b8; }
+            QWidget#inspectorPanel { background: #efefef; }
             QGroupBox {
-                background: #ffffff;
-                border: 1px solid #d8dee6;
-                border-radius: 6px;
-                margin-top: 10px;
-                padding: 12px;
+                background: #f8f8f8;
+                border: 1px solid #bfc3c7;
+                border-radius: 0;
+                margin-top: 17px;
+                padding-top: 4px;
+                font-weight: 600;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 4px;
+                subcontrol-position: top left;
+                left: 0;
+                top: 0;
+                padding: 2px 7px;
+                background: #dfe2e5;
+                border-bottom: 1px solid #bfc3c7;
+                width: 100%;
             }
+            QLabel#navigatorPreview { background: #d2d4d6; border: 1px solid #aeb3b8; color: #666666; }
             QLineEdit, QSpinBox, QComboBox {
-                min-height: 28px;
-                border: 1px solid #c8d0da;
-                border-radius: 4px;
-                padding: 3px 6px;
+                min-height: 23px;
+                border: 1px solid #aeb4ba;
+                border-radius: 1px;
+                padding: 1px 4px;
                 background: #ffffff;
             }
             QPushButton {
-                min-height: 30px;
-                border: 1px solid #b8c2cc;
-                border-radius: 4px;
-                padding: 4px 12px;
+                min-height: 25px;
+                border: 1px solid #aeb4ba;
+                border-radius: 2px;
+                padding: 2px 8px;
+                background: #f7f7f7;
+            }
+            QPushButton:hover, QToolButton:hover { background: #e4eef6; border-color: #8eafc7; }
+            QPushButton:disabled { color: #999999; background: #e6e6e6; }
+            QToolButton { border: 1px solid #adb3b8; background: #f9f9f9; border-radius: 1px; }
+            QListWidget, QTableWidget {
                 background: #ffffff;
+                border: 1px solid #b8bdc2;
+                gridline-color: #d7dade;
+                selection-background-color: #cce7f6;
+                selection-color: #151515;
             }
-            QPushButton:hover { background: #eef4fb; }
-            QPushButton:disabled { color: #8a95a3; background: #edf0f3; }
-            QTableWidget {
-                background: #ffffff;
-                border: 1px solid #d8dee6;
-                gridline-color: #e1e6ec;
-                selection-background-color: #d8eaff;
-            }
-            QLabel {
-                color: #1f2933;
-            }
+            QListWidget::item { min-height: 23px; border-bottom: 1px solid #e3e3e3; }
+            QHeaderView::section { background: #e2e5e8; border: 0; border-right: 1px solid #c3c7ca; padding: 3px; }
+            QSlider::groove:horizontal { height: 3px; background: #c1c5c8; }
+            QSlider::handle:horizontal { width: 10px; margin: -5px 0; background: #8e969d; border: 1px solid #6f777d; }
+            QLabel { color: #24282b; }
             """
         )
+    def _set_default_spot_shapes(self) -> None:
+        self.spot_shape_input.blockSignals(True)
+        self.spot_shape_input.clear()
+        self.spot_shape_input.addItem("Круглая", "circle")
+        self.spot_shape_input.addItem("Эллиптическая", "ellipse")
+        self.spot_shape_input.addItem("Квадратная", "square")
+        self.spot_shape_input.addItem("Линейная", "line")
+        self.spot_shape_input.blockSignals(False)
+
+    def choose_ppd_profile(self) -> None:
+        file_name, _ = QFileDialog.getOpenFileName(self, "Загрузить профиль RIP", "", "PPD (*.ppd *.PPD)")
+        if not file_name:
+            return
+        try:
+            profile = parse_ppd(Path(file_name))
+        except Exception as exc:
+            logger.exception("User PPD profile could not be loaded: %s", file_name)
+            QMessageBox.critical(self, "Ошибка PPD", str(exc))
+            return
+        self.ppd_profiles.append(profile)
+        self.profile_input.addItem(profile.name, profile)
+        self.profile_input.setCurrentIndex(self.profile_input.count() - 1)
+        logger.info("User loaded PPD profile: %s", file_name)
+
+    def current_ppd_profile(self) -> PpdProfile | None:
+        profile = self.profile_input.currentData()
+        return profile if isinstance(profile, PpdProfile) else None
+
+    def on_profile_changed(self, _value: int = 0) -> None:
+        profile = self.current_ppd_profile()
+        self.profile_sync_in_progress = True
+        try:
+            self.spot_shape_input.blockSignals(True)
+            self.spot_shape_input.clear()
+            if profile is None:
+                for label, code in (("Круглая", "circle"), ("Эллиптическая", "ellipse"), ("Квадратная", "square"), ("Линейная", "line")):
+                    self.spot_shape_input.addItem(label, code)
+            else:
+                for _ppd_code, label, engine_code in profile.dot_shapes:
+                    self.spot_shape_input.addItem(label, engine_code)
+                if profile.default_resolution:
+                    self.dpi_input.setValue(profile.default_resolution)
+                frequencies = profile.frequencies_for_dpi(self.dpi_input.value())
+                if frequencies:
+                    self.screen_frequency_input.setValue(int(min(frequencies, key=lambda value: abs(value - self.screen_frequency_input.value()))))
+            self.spot_shape_input.blockSignals(False)
+            self.apply_profile_screens()
+        finally:
+            self.profile_sync_in_progress = False
+        logger.info("RIP profile selected: %s", profile.name if profile else "manual")
+        self.render_preview()
+
+    def on_screen_settings_changed(self, _value: int = 0) -> None:
+        if self.profile_sync_in_progress:
+            return
+        profile = self.current_ppd_profile()
+        if profile is not None:
+            frequencies = profile.frequencies_for_dpi(self.dpi_input.value())
+            if frequencies and self.screen_frequency_input.value() not in frequencies:
+                self.profile_sync_in_progress = True
+                self.screen_frequency_input.setValue(int(min(frequencies, key=lambda value: abs(value - self.screen_frequency_input.value()))))
+                self.profile_sync_in_progress = False
+            self.apply_profile_screens()
+        self.render_preview()
+
+    def apply_profile_screens(self) -> None:
+        profile = self.current_ppd_profile()
+        if profile is None:
+            for layer in self.preview_layers:
+                layer["frequency_lpi"] = layer.get("source_frequency_lpi")
+                layer["angle_deg"] = layer.get("source_angle_deg")
+        else:
+            specs = profile.screen_specs(self.dpi_input.value(), float(self.screen_frequency_input.value()))
+            for layer in self.preview_layers:
+                plate_name = str(layer["name"]).strip().upper()
+                plate_key = {
+                    "CYAN": "C",
+                    "MAGENTA": "M",
+                    "YELLOW": "Y",
+                    "BLACK": "K",
+                }.get(plate_name, plate_name)
+                spec = specs.get(plate_key) or specs.get("Spot")
+                if spec is not None:
+                    layer["frequency_lpi"] = spec.frequency_lpi
+                    layer["angle_deg"] = spec.angle_deg
+        self.refresh_layer_labels()
+
+    def refresh_layer_labels(self) -> None:
+        for row, layer in enumerate(self.preview_layers):
+            item = self.layer_list.item(row)
+            if item is not None:
+                item.setText(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
 
     def choose_sources(self) -> None:
         logger.info("User opened input file chooser")
@@ -403,6 +663,9 @@ class MainWindow(QMainWindow):
         self.zoom_in_button.setEnabled(not busy)
         self.screen_mode_input.setEnabled(not busy)
         self.screen_frequency_input.setEnabled(not busy)
+        self.profile_input.setEnabled(not busy)
+        self.load_profile_button.setEnabled(not busy)
+        self.spot_shape_input.setEnabled(not busy)
 
     def open_output_dir(self) -> None:
         if self.last_result:
@@ -428,15 +691,31 @@ class MainWindow(QMainWindow):
             screen_spec = result.screen_specs.get(plate.name)
             frequency = screen_spec.frequency_lpi if screen_spec else None
             angle = screen_spec.angle_deg if screen_spec else default_screen_angle(plate.name)
-            layer = {"name": plate.name, "path": plate.tiff_path, "enabled": True, "frequency_lpi": frequency, "angle_deg": angle}
+            layer = {
+                "name": plate.name,
+                "path": plate.tiff_path,
+                "enabled": True,
+                "frequency_lpi": frequency,
+                "angle_deg": angle,
+                "source_frequency_lpi": frequency,
+                "source_angle_deg": angle,
+            }
             self.preview_layers.append(layer)
             item = QListWidgetItem(f"{plate.name}  {angle:g}°")
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            swatch = QPixmap(12, 12)
+            swatch.fill(QColor(*preview_ink_rgb(plate.name)))
+            item.setIcon(swatch)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
             item.setCheckState(Qt.CheckState.Checked)
             self.layer_list.addItem(item)
         self.layer_list.blockSignals(False)
         self.preview_zoom = 1.0
         self.render_preview()
+        self.fit_preview()
 
     def on_layer_changed(self, item: QListWidgetItem) -> None:
         row = self.layer_list.row(item)
@@ -472,11 +751,67 @@ class MainWindow(QMainWindow):
     def reset_preview_zoom(self) -> None:
         self.set_preview_zoom(1.0)
 
-    def set_preview_zoom(self, zoom: float) -> None:
+    def set_preview_zoom(self, zoom: float, sync_slider: bool = True) -> None:
         self.preview_zoom = min(6.0, max(0.1, zoom))
-        self.zoom_reset_button.setText(f"{int(self.preview_zoom * 100)}%")
+        percent = int(round(self.preview_zoom * 100))
+        self.zoom_reset_button.setText(f"{percent}%")
+        if hasattr(self, "zoom_percent_label"):
+            self.zoom_percent_label.setText(f"{percent}%")
+        if sync_slider and hasattr(self, "zoom_slider"):
+            self.zoom_slider.blockSignals(True)
+            self.zoom_slider.setValue(percent)
+            self.zoom_slider.blockSignals(False)
         logger.info("Preview zoom changed: %.2f", self.preview_zoom)
         self.apply_preview_zoom()
+
+    def fit_preview(self) -> None:
+        if self.preview_pixmap is None:
+            return
+        source_size = self.preview_pixmap.size()
+        if self.preview_rotation % 180:
+            source_width, source_height = source_size.height(), source_size.width()
+        else:
+            source_width, source_height = source_size.width(), source_size.height()
+        viewport = self.preview_scroll.viewport().size()
+        zoom = min((viewport.width() - 28) / source_width, (viewport.height() - 28) / source_height)
+        self.set_preview_zoom(min(1.0, zoom))
+
+    def rotate_preview_left(self) -> None:
+        self.preview_rotation = (self.preview_rotation - 90) % 360
+        self.apply_preview_zoom()
+
+    def rotate_preview_right(self) -> None:
+        self.preview_rotation = (self.preview_rotation + 90) % 360
+        self.apply_preview_zoom()
+
+    def update_navigator(self, pixmap: QPixmap | None = None) -> None:
+        if not hasattr(self, "navigator_label"):
+            return
+        source = pixmap or self.preview_pixmap
+        if source is None or source.isNull():
+            self.navigator_label.setText("Нет документа")
+            self.navigator_label.setPixmap(QPixmap())
+            return
+        thumbnail = source.scaled(
+            self.navigator_label.size() - QSize(12, 12),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.navigator_label.setText("")
+        self.navigator_label.setPixmap(thumbnail)
+
+    def update_document_info(self, result: CoverageResult) -> None:
+        dimensions = "Размер: —"
+        first_tiff = next((plate.tiff_path for plate in result.plates if plate.tiff_path and plate.tiff_path.exists()), None)
+        if first_tiff:
+            with Image.open(first_tiff) as image:
+                width_mm = image.width / self.dpi_input.value() * 25.4
+                height_mm = image.height / self.dpi_input.value() * 25.4
+                dimensions = f"Размер: {width_mm:.2f} × {height_mm:.2f} мм"
+        self.document_info_label.setText(
+            f"{dimensions}\nРазрешение: {self.dpi_input.value()} dpi\n"
+            f"Каналов: {len(result.plates)}\nФайл: {result.source_paths[0].name}"
+        )
 
     def render_preview(self) -> None:
         enabled_layers = [layer for layer in self.preview_layers if layer.get("enabled")]
@@ -492,6 +827,7 @@ class MainWindow(QMainWindow):
                 dpi=self.dpi_input.value(),
                 screen_mode=str(self.screen_mode_input.currentData()),
                 fallback_frequency_lpi=float(self.screen_frequency_input.value()),
+                spot_shape=str(self.spot_shape_input.currentData()),
             )
         except Exception:
             logger.exception("Failed to render separation preview")
@@ -507,13 +843,17 @@ class MainWindow(QMainWindow):
     def apply_preview_zoom(self) -> None:
         if self.preview_pixmap is None:
             return
-        source_size = self.preview_pixmap.size()
-        target_size = source_size.scaled(
-            int(source_size.width() * self.preview_zoom),
-            int(source_size.height() * self.preview_zoom),
-            Qt.AspectRatioMode.KeepAspectRatio,
+        displayed = self.preview_pixmap
+        if self.preview_rotation:
+            displayed = displayed.transformed(
+                QTransform().rotate(self.preview_rotation),
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        target_size = QSize(
+            max(1, int(displayed.width() * self.preview_zoom)),
+            max(1, int(displayed.height() * self.preview_zoom)),
         )
-        scaled = self.preview_pixmap.scaled(
+        scaled = displayed.scaled(
             target_size,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation
@@ -523,68 +863,47 @@ class MainWindow(QMainWindow):
         self.preview_label.setText("")
         self.preview_label.setPixmap(scaled)
         self.preview_label.resize(scaled.size())
+        self.update_navigator(displayed)
 
 
 def preview_ink_rgb(name: str) -> tuple[int, int, int]:
     process_colors = {
-        "C": (0, 255, 255),
-        "M": (255, 0, 255),
-        "Y": (255, 255, 0),
-        "K": (0, 0, 0),
+        "C": (0, 174, 239),
+        "CYAN": (0, 174, 239),
+        "M": (236, 0, 140),
+        "MAGENTA": (236, 0, 140),
+        "Y": (255, 221, 0),
+        "YELLOW": (255, 221, 0),
+        "K": (30, 30, 30),
+        "BLACK": (30, 30, 30),
     }
-    if name in process_colors:
-        return process_colors[name]
+    normalized = name.strip().upper()
+    if normalized in process_colors:
+        return process_colors[normalized]
     seed = sum(ord(ch) for ch in name)
     return ((seed * 37) % 206 + 25, (seed * 67) % 206 + 25, (seed * 97) % 206 + 25)
 
 
 def build_preview_image(
     layers: list[dict[str, object]],
-    max_size: int = 1200,
+    max_size: int = 3200,
     dpi: int = DEFAULT_DPI,
     screen_mode: str = SCREEN_MODE_NONE,
     fallback_frequency_lpi: float = DEFAULT_SCREEN_FREQUENCY,
+    spot_shape: str = "circle",
 ) -> Image.Image:
-    base_size: tuple[int, int] | None = None
-    composite: np.ndarray | None = None
+    return render_preview(
+        layers_from_dicts(layers),
+        color_resolver=preview_ink_rgb,
+        max_size=max_size,
+        dpi=dpi,
+        screen_mode=screen_mode,
+        fallback_frequency_lpi=fallback_frequency_lpi,
+        spot_shape=spot_shape,
+    )
 
-    for layer in layers:
-        layer_path = Path(layer["path"])
-        image = load_preview_layer(str(layer_path.resolve()), layer_path.stat().st_mtime_ns, max_size).copy()
-        if base_size is None:
-            base_size = image.size
-            composite = np.full((base_size[1], base_size[0], 3), 255.0, dtype=np.float32)
-        elif image.size != base_size:
-            image = image.resize(base_size, Image.Resampling.LANCZOS)
-
-        if screen_mode != SCREEN_MODE_NONE:
-            frequency_lpi = float(layer.get("frequency_lpi") or fallback_frequency_lpi)
-            angle_deg = float(layer.get("angle_deg") or default_screen_angle(str(layer["name"])))
-            image = apply_halftone(
-                image,
-                mode=screen_mode,
-                dpi=dpi,
-                frequency_lpi=frequency_lpi,
-                angle_deg=angle_deg,
-            )
-
-        ink = (255.0 - np.asarray(image, dtype=np.float32)) / 255.0
-        color = np.asarray(preview_ink_rgb(str(layer["name"])), dtype=np.float32) / 255.0
-        transmittance = 1.0 - ink[..., None] * (1.0 - color)
-        composite = composite * transmittance
-
-    if composite is None:
-        return Image.new("RGB", (600, 400), "white")
-    return Image.fromarray(np.clip(composite, 0, 255).astype(np.uint8), "RGB")
-
-
-@lru_cache(maxsize=32)
-def load_preview_layer(path: str, modified_ns: int, max_size: int) -> Image.Image:
-    del modified_ns
-    with Image.open(path) as source:
-        image = source.convert("L")
-        image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-        return image.copy()
+def effective_preview_dpi(document_dpi: float, preview_scale: float) -> float:
+    return max(1.0, float(document_dpi) * float(preview_scale))
 
 
 def pil_image_to_qimage(image: Image.Image) -> QImage:
