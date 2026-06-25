@@ -64,11 +64,11 @@ __kernel void halftone(
     uchar source = gray[index];
 
     // Preserve paper and 100% solids, including tiny conversion noise.
-    if (source >= (uchar)252) {
+    if (source >= (uchar)254) {
         output[index] = (uchar)255;
         return;
     }
-    if (source <= (uchar)3) {
+    if (source <= (uchar)1) {
         output[index] = (uchar)0;
         return;
     }
@@ -94,9 +94,7 @@ __kernel void halftone(
     cell_x = cell_x - floor(cell_x) - 0.5f;
     cell_y = cell_y - floor(cell_y) - 0.5f;
     float threshold = shape_threshold(cell_x, cell_y, spot_shape);
-    float edge_width = clamp(0.75f / cell_size, 0.015f, 0.12f);
-    float dot_alpha = clamp((ink - threshold) / edge_width + 0.5f, 0.0f, 1.0f);
-    output[index] = convert_uchar_sat_rte(255.0f * (1.0f - dot_alpha));
+    output[index] = threshold <= ink ? (uchar)0 : (uchar)255;
 }
 """
 

@@ -13,6 +13,10 @@ LOG_FILE = setup_logging()
 logger = logging.getLogger(__name__)
 logger.info("Application bootstrap started. Log file: %s", LOG_FILE)
 
+INTERACTIVE_PREVIEW_MAX_SIZE = 4096
+DISPLAY_PREVIEW_MAX_SIDE = 8192
+
+
 try:
     import numpy as np
     from PIL import Image
@@ -21,7 +25,7 @@ except Exception:
     raise
 
 try:
-    from PySide6.QtCore import QObject, QSize, Qt, QThread, QUrl, Signal
+    from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
     from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QImage, QPixmap, QTransform
     from PySide6.QtWidgets import (
         QApplication,
@@ -119,6 +123,10 @@ class MainWindow(QMainWindow):
         self.preview_rotation = 0
         self.ppd_profiles = discover_ppd_profiles(Path(__file__).resolve().parent)
         self.profile_sync_in_progress = False
+        self.preview_render_pending = False
+        self.preview_render_timer = QTimer(self)
+        self.preview_render_timer.setSingleShot(True)
+        self.preview_render_timer.timeout.connect(self.render_preview)
 
         self.source_input = QLineEdit()
         self.source_input.setPlaceholderText("Выберите PDF, PS или EPS. Для нескольких файлов используйте кнопку Обзор...")
@@ -171,7 +179,7 @@ class MainWindow(QMainWindow):
         self.screen_mode_input.addItem("Стохастика FM", SCREEN_MODE_FM)
         self.screen_mode_input.addItem("Error diffusion", SCREEN_MODE_ERROR_DIFFUSION)
         self.screen_mode_input.addItem("Гибридный XM", SCREEN_MODE_HYBRID)
-        self.screen_mode_input.currentIndexChanged.connect(lambda _index: self.render_preview())
+        self.screen_mode_input.currentIndexChanged.connect(lambda _index: self.schedule_render_preview())
 
         self.profile_input = QComboBox()
         self.profile_input.addItem("Вручную", None)
@@ -185,7 +193,7 @@ class MainWindow(QMainWindow):
 
         self.spot_shape_input = QComboBox()
         self._set_default_spot_shapes()
-        self.spot_shape_input.currentIndexChanged.connect(lambda _index: self.render_preview())
+        self.spot_shape_input.currentIndexChanged.connect(lambda _index: self.schedule_render_preview())
 
         self.screen_frequency_input = QSpinBox()
         self.screen_frequency_input.setRange(20, 400)
@@ -520,7 +528,7 @@ class MainWindow(QMainWindow):
         finally:
             self.profile_sync_in_progress = False
         logger.info("RIP profile selected: %s", profile.name if profile else "manual")
-        self.render_preview()
+        self.schedule_render_preview()
 
     def on_screen_settings_changed(self, _value: int = 0) -> None:
         if self.profile_sync_in_progress:
@@ -533,7 +541,7 @@ class MainWindow(QMainWindow):
                 self.screen_frequency_input.setValue(int(min(frequencies, key=lambda value: abs(value - self.screen_frequency_input.value()))))
                 self.profile_sync_in_progress = False
             self.apply_profile_screens()
-        self.render_preview()
+        self.schedule_render_preview()
 
     def apply_profile_screens(self) -> None:
         profile = self.current_ppd_profile()
@@ -726,7 +734,7 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self.preview_layers):
             self.preview_layers[row]["enabled"] = item.checkState() == Qt.CheckState.Checked
             logger.info("Preview layer toggled: %s enabled=%s", self.preview_layers[row]["name"], self.preview_layers[row]["enabled"])
-            self.render_preview()
+            self.schedule_render_preview()
 
     def move_selected_layer_up(self) -> None:
         self.move_selected_layer(-1)
@@ -744,7 +752,7 @@ class MainWindow(QMainWindow):
         self.layer_list.insertItem(new_row, item)
         self.layer_list.setCurrentRow(new_row)
         logger.info("Preview layer moved: from=%s to=%s", row, new_row)
-        self.render_preview()
+        self.schedule_render_preview()
 
     def zoom_in_preview(self) -> None:
         self.set_preview_zoom(self.preview_zoom * 1.25)
@@ -756,7 +764,15 @@ class MainWindow(QMainWindow):
         self.set_preview_zoom(1.0)
 
     def set_preview_zoom(self, zoom: float, sync_slider: bool = True) -> None:
-        self.preview_zoom = min(6.0, max(0.1, zoom))
+        max_zoom = 6.0
+        if self.preview_pixmap is not None and not self.preview_pixmap.isNull():
+            if self.preview_rotation % 180:
+                max_side = max(self.preview_pixmap.height(), self.preview_pixmap.width())
+            else:
+                max_side = max(self.preview_pixmap.width(), self.preview_pixmap.height())
+            if max_side > 0:
+                max_zoom = min(max_zoom, max(0.1, DISPLAY_PREVIEW_MAX_SIDE / max_side))
+        self.preview_zoom = min(max_zoom, max(0.1, zoom))
         percent = int(round(self.preview_zoom * 100))
         self.zoom_reset_button.setText(f"{percent}%")
         if hasattr(self, "zoom_percent_label"):
@@ -817,7 +833,16 @@ class MainWindow(QMainWindow):
             f"Каналов: {len(result.plates)}\nФайл: {result.source_paths[0].name}"
         )
 
+
+    def schedule_render_preview(self, delay_ms: int = 250) -> None:
+        if not self.preview_layers:
+            return
+        self.preview_render_pending = True
+        self.status_label.setText("Обновление предпросмотра...")
+        self.preview_render_timer.start(delay_ms)
+
     def render_preview(self) -> None:
+        self.preview_render_pending = False
         enabled_layers = [layer for layer in self.preview_layers if layer.get("enabled")]
         if not enabled_layers:
             self.preview_label.setText("Все каналы выключены")
@@ -828,6 +853,7 @@ class MainWindow(QMainWindow):
         try:
             preview = build_preview_image(
                 enabled_layers,
+                max_size=INTERACTIVE_PREVIEW_MAX_SIZE,
                 dpi=self.dpi_input.value(),
                 screen_mode=str(self.screen_mode_input.currentData()),
                 fallback_frequency_lpi=float(self.screen_frequency_input.value()),
@@ -843,6 +869,8 @@ class MainWindow(QMainWindow):
         qimage = pil_image_to_qimage(preview)
         self.preview_pixmap = QPixmap.fromImage(qimage)
         self.apply_preview_zoom()
+        if self.last_result:
+            self.status_label.setText(f"Готово. Файлы цветоделения: {self.last_result.output_dir}")
 
     def apply_preview_zoom(self) -> None:
         if self.preview_pixmap is None:

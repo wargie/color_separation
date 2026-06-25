@@ -7,14 +7,14 @@ import unittest
 import numpy as np
 from PIL import Image
 
-from halftone import apply_halftone, halftone_cell_size
+from halftone import apply_halftone, halftone_cell_size, round_dot_diameter_microns, screen_pitch_microns, screen_pitch_microns_per_cm
 
 
 class HalftoneTests(unittest.TestCase):
     def test_cpu_preserves_paper_and_solids(self) -> None:
         source = np.full((300, 300), 128, dtype=np.uint8)
         source[:100] = 254
-        source[200:] = 2
+        source[200:] = 0
         image = Image.fromarray(source)
 
         for mode in ("am", "fm", "hybrid"):
@@ -39,7 +39,7 @@ class HalftoneTests(unittest.TestCase):
 
         source = np.full((300, 300), 128, dtype=np.uint8)
         source[:100] = 254
-        source[200:] = 2
+        source[200:] = 0
         image = Image.fromarray(source)
 
         for mode in ("am", "fm", "hybrid"):
@@ -58,7 +58,7 @@ class HalftoneTests(unittest.TestCase):
     def test_cpu_spot_shapes_preserve_paper_and_solids(self) -> None:
         source = np.full((256, 256), 128, dtype=np.uint8)
         source[:32] = 254
-        source[-32:] = 2
+        source[-32:] = 0
         image = Image.fromarray(source)
 
         outputs = []
@@ -94,15 +94,39 @@ class HalftoneTests(unittest.TestCase):
                 prefer_gpu=False,
             )
         )
-        self.assertTrue(np.all(output[:, :4] == 255))
-        self.assertTrue(np.all(output[:, 7:] == 0))
-        middle = output[:, 4:7]
-        self.assertTrue(np.any((middle > 0) & (middle < 255)) or np.any(middle != source[:, 4:7]))
+        self.assertTrue(np.all(output[:, :2] == 255))
+        self.assertTrue(np.all(output[:, -2:] == 0))
+        middle = output[:, 2:-2]
+        self.assertTrue(np.any((middle > 0) & (middle < 255)) or np.any(middle != source[:, 2:-2]))
 
     def test_cell_size_matches_requested_lineature(self) -> None:
         self.assertAlmostEqual(halftone_cell_size(160.952, 150.0), 1.0730133333)
         self.assertEqual(halftone_cell_size(100.0, 150.0), 1.0)
 
+
+
+    def test_physical_screen_geometry_matches_reference_table(self) -> None:
+        self.assertAlmostEqual(screen_pitch_microns(150), 169.3333333, places=4)
+        self.assertAlmostEqual(screen_pitch_microns_per_cm(60), 166.6666667, places=4)
+        self.assertAlmostEqual(round_dot_diameter_microns(150, 0.01), 19.1, delta=0.1)
+        self.assertAlmostEqual(round_dot_diameter_microns(150, 0.02), 27.0, delta=0.1)
+        self.assertAlmostEqual(round_dot_diameter_microns(150, 0.03), 33.1, delta=0.1)
+        self.assertAlmostEqual(round_dot_diameter_microns(150, 0.50), 135.1, delta=0.1)
+
+    def test_highlight_tones_are_screened_not_dropped_as_paper(self) -> None:
+        source = np.full((512, 512), 252, dtype=np.uint8)
+        output = np.asarray(
+            apply_halftone(
+                Image.fromarray(source),
+                mode="am",
+                dpi=2400,
+                frequency_lpi=150,
+                angle_deg=45,
+                prefer_gpu=False,
+            )
+        )
+        self.assertGreater(np.count_nonzero(output == 0), 0)
+        self.assertLess(np.count_nonzero(output == 0), output.size)
 
     def test_flexo_mode_holds_minimum_highlight_dot(self) -> None:
         source = np.full((256, 256), 251, dtype=np.uint8)

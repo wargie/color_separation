@@ -31,8 +31,8 @@ SCREEN_MODE_FLEXO = "flexo"
 SCREEN_MODE_ERROR_DIFFUSION = "error_diffusion"
 SCREEN_MODE_CODES = {SCREEN_MODE_AM: 1, SCREEN_MODE_FM: 2, SCREEN_MODE_HYBRID: 3, SCREEN_MODE_FLEXO: 4}
 SPOT_SHAPE_CODES = {"circle": 0, "ellipse": 1, "square": 2, "line": 3}
-PAPER_VALUE_THRESHOLD = 252
-SOLID_INK_VALUE_THRESHOLD = 3
+PAPER_VALUE_THRESHOLD = 254
+SOLID_INK_VALUE_THRESHOLD = 1
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,24 @@ def halftone_cell_size(dpi: float, frequency_lpi: float) -> float:
     if dpi <= 0 or frequency_lpi <= 0:
         return 1.0
     return max(1.0, float(dpi) / float(frequency_lpi))
+
+
+def screen_pitch_microns(frequency_lpi: float) -> float:
+    if frequency_lpi <= 0:
+        return 0.0
+    return 25400.0 / float(frequency_lpi)
+
+
+def screen_pitch_microns_per_cm(frequency_lpcm: float) -> float:
+    if frequency_lpcm <= 0:
+        return 0.0
+    return 10000.0 / float(frequency_lpcm)
+
+
+def round_dot_diameter_microns(frequency_lpi: float, tone_fraction: float) -> float:
+    pitch = screen_pitch_microns(frequency_lpi)
+    tone = float(np.clip(tone_fraction, 0.0, 1.0))
+    return pitch * math.sqrt(4.0 * tone / math.pi)
 
 
 def default_screen_angle(plate_name: str) -> float:
@@ -82,9 +100,7 @@ def apply_am_halftone(
     ink = np.clip(ink, 0.0, 1.0)
     if minimum_dot > 0:
         ink = np.where((ink > 0.0) & (ink < minimum_dot), minimum_dot, ink)
-    edge_width = np.float32(np.clip(0.75 / cell_size, 0.015, 0.12))
-    dot_alpha = np.clip((ink - spot_threshold) / edge_width + 0.5, 0.0, 1.0)
-    screened = np.rint(255.0 * (1.0 - dot_alpha)).astype(np.uint8)
+    screened = np.where(spot_threshold <= ink, 0, 255).astype(np.uint8)
     _preserve_paper_and_solids(screened, arr)
     return Image.fromarray(screened)
 
