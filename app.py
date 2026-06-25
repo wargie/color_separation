@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -29,6 +30,7 @@ try:
     from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QImage, QPixmap, QTransform
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QComboBox,
         QFileDialog,
         QFormLayout,
@@ -118,6 +120,7 @@ class MainWindow(QMainWindow):
         self.worker: CalculationWorker | None = None
         self.last_result: CoverageResult | None = None
         self.preview_layers: list[dict[str, object]] = []
+        self.layer_checkboxes: list[QCheckBox] = []
         self.preview_zoom = 1.0
         self.preview_pixmap: QPixmap | None = None
         self.preview_rotation = 0
@@ -140,6 +143,8 @@ class MainWindow(QMainWindow):
         self.dpi_input = QSpinBox()
         self.dpi_input.setRange(72, 4800)
         self.dpi_input.setSingleStep(50)
+        self.dpi_input.setAccelerated(True)
+        self.dpi_input.setMinimumWidth(110)
         self.dpi_input.setValue(DEFAULT_DPI)
 
         self.status_label = QLabel("Готово")
@@ -198,6 +203,8 @@ class MainWindow(QMainWindow):
         self.screen_frequency_input = QSpinBox()
         self.screen_frequency_input.setRange(20, 400)
         self.screen_frequency_input.setSingleStep(5)
+        self.screen_frequency_input.setAccelerated(True)
+        self.screen_frequency_input.setMinimumWidth(110)
         self.screen_frequency_input.setValue(DEFAULT_SCREEN_FREQUENCY)
         self.screen_frequency_input.valueChanged.connect(self.on_screen_settings_changed)
         self.dpi_input.valueChanged.connect(self.on_screen_settings_changed)
@@ -471,7 +478,11 @@ class MainWindow(QMainWindow):
                 selection-background-color: #cce7f6;
                 selection-color: #151515;
             }
-            QListWidget::item { min-height: 23px; border-bottom: 1px solid #e3e3e3; }
+            QListWidget::item { min-height: 28px; border-bottom: 1px solid #e3e3e3; }
+            QCheckBox { spacing: 7px; }
+            QCheckBox::indicator { width: 15px; height: 15px; }
+            QSpinBox::up-button, QSpinBox::down-button { width: 22px; border-left: 1px solid #aeb5bb; background: #f5f7f8; }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #e3eef7; }
             QHeaderView::section { background: #e2e5e8; border: 0; border-right: 1px solid #c3c7ca; padding: 3px; }
             QSlider::groove:horizontal { height: 3px; background: #c1c5c8; }
             QSlider::handle:horizontal { width: 10px; margin: -5px 0; background: #8e969d; border: 1px solid #6f777d; }
@@ -567,9 +578,11 @@ class MainWindow(QMainWindow):
 
     def refresh_layer_labels(self) -> None:
         for row, layer in enumerate(self.preview_layers):
+            if row < len(self.layer_checkboxes):
+                self.layer_checkboxes[row].setText(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
             item = self.layer_list.item(row)
             if item is not None:
-                item.setText(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
+                item.setData(Qt.ItemDataRole.DisplayRole, f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
 
     def choose_sources(self) -> None:
         logger.info("User opened input file chooser")
@@ -702,8 +715,6 @@ class MainWindow(QMainWindow):
 
     def setup_preview_layers(self, result: CoverageResult) -> None:
         self.preview_layers = []
-        self.layer_list.blockSignals(True)
-        self.layer_list.clear()
         for plate in result.plates:
             if not plate.tiff_path or not plate.tiff_path.exists():
                 logger.warning("Preview layer skipped because TIFF is missing: %s", plate)
@@ -721,27 +732,60 @@ class MainWindow(QMainWindow):
                 "source_angle_deg": angle,
             }
             self.preview_layers.append(layer)
-            item = QListWidgetItem(f"{plate.name}  {angle:g}°")
-            swatch = QPixmap(12, 12)
-            swatch.fill(QColor(*preview_ink_rgb(plate.name)))
-            item.setIcon(swatch)
-            item.setFlags(
-                Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsUserCheckable
-            )
-            item.setCheckState(Qt.CheckState.Checked)
-            self.layer_list.addItem(item)
-        self.layer_list.blockSignals(False)
+        self.rebuild_layer_list()
         self.preview_zoom = 1.0
         self.render_preview()
         self.fit_preview()
 
+    def rebuild_layer_list(self) -> None:
+        self.layer_checkboxes = []
+        self.layer_list.blockSignals(True)
+        self.layer_list.clear()
+        for row, layer in enumerate(self.preview_layers):
+            angle = float(layer.get("angle_deg") or 0)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.DisplayRole, f"{layer['name']}  {angle:g}°")
+            item.setSizeHint(QSize(240, 28))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.layer_list.addItem(item)
+            self.layer_list.setItemWidget(item, self.create_layer_widget(row))
+        self.layer_list.blockSignals(False)
+
+    def create_layer_widget(self, row: int) -> QWidget:
+        layer = self.preview_layers[row]
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(2, 1, 2, 1)
+        layout.setSpacing(6)
+
+        checkbox = QCheckBox(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
+        checkbox.setChecked(bool(layer.get("enabled", True)))
+        checkbox.toggled.connect(lambda checked, cb=checkbox: self.on_layer_checkbox_toggled(cb, checked))
+        self.layer_checkboxes.append(checkbox)
+
+        swatch = QLabel()
+        swatch.setFixedSize(12, 12)
+        color = QColor(*preview_ink_rgb(str(layer["name"])))
+        swatch.setStyleSheet(f"background: {color.name()}; border: 1px solid #7e858b;")
+
+        layout.addWidget(checkbox, 1)
+        layout.addWidget(swatch)
+        return widget
+
+    def on_layer_checkbox_toggled(self, checkbox: QCheckBox, checked: bool) -> None:
+        try:
+            row = self.layer_checkboxes.index(checkbox)
+        except ValueError:
+            return
+        self.layer_list.setCurrentRow(row)
+        if 0 <= row < len(self.preview_layers):
+            self.preview_layers[row]["enabled"] = checked
+            logger.info("Preview layer toggled: %s enabled=%s", self.preview_layers[row]["name"], checked)
+            self.schedule_render_preview()
+
     def on_layer_changed(self, item: QListWidgetItem) -> None:
         row = self.layer_list.row(item)
         if 0 <= row < len(self.preview_layers):
-            self.preview_layers[row]["enabled"] = item.checkState() == Qt.CheckState.Checked
-            logger.info("Preview layer toggled: %s enabled=%s", self.preview_layers[row]["name"], self.preview_layers[row]["enabled"])
             self.schedule_render_preview()
 
     def move_selected_layer_up(self) -> None:
@@ -756,8 +800,7 @@ class MainWindow(QMainWindow):
         if row < 0 or new_row < 0 or new_row >= len(self.preview_layers):
             return
         self.preview_layers[row], self.preview_layers[new_row] = self.preview_layers[new_row], self.preview_layers[row]
-        item = self.layer_list.takeItem(row)
-        self.layer_list.insertItem(new_row, item)
+        self.rebuild_layer_list()
         self.layer_list.setCurrentRow(new_row)
         logger.info("Preview layer moved: from=%s to=%s", row, new_row)
         self.schedule_render_preview()
@@ -920,8 +963,60 @@ def preview_ink_rgb(name: str) -> tuple[int, int, int]:
     normalized = name.strip().upper()
     if normalized in process_colors:
         return process_colors[normalized]
+
+    pantone_colors = {
+        "PANTONE 281 C": (0, 32, 91),
+        "PANTONE 349 C": (4, 106, 56),
+        "PANTONE 354 C": (0, 177, 64),
+        "PANTONE 485 C": (218, 41, 28),
+        "PANTONE 7587 C": (146, 71, 42),
+    }
+    compact = re.sub(r"\s+", " ", normalized.replace("PMS", "PANTONE")).strip()
+    compact = re.sub(r"^(PANTONE) (\d+)([A-Z])$", r"\1 \2 \3", compact)
+    if compact in pantone_colors:
+        return pantone_colors[compact]
+
+    number_match = re.search(r"(?:PANTONE|PMS)\s*(\d+)", compact)
+    if number_match:
+        number = int(number_match.group(1))
+        if 100 <= number <= 149:
+            return (246, 218, 58)
+        if 150 <= number <= 179:
+            return (235, 132, 39)
+        if 180 <= number <= 249:
+            return (207, 38, 58)
+        if 250 <= number <= 269:
+            return (149, 72, 155)
+        if 270 <= number <= 299:
+            return (40, 84, 160)
+        if 300 <= number <= 329:
+            return (0, 130, 173)
+        if 330 <= number <= 399:
+            return (0, 135, 85)
+        if 400 <= number <= 449:
+            return (116, 107, 98)
+        if 450 <= number <= 499:
+            return (143, 78, 48)
+        if 500 <= number <= 549:
+            return (112, 88, 134)
+        if 550 <= number <= 599:
+            return (100, 148, 145)
+        if 600 <= number <= 699:
+            return (214, 116, 152)
+        if 700 <= number <= 799:
+            return (219, 97, 47)
+        if 7400 <= number <= 7499:
+            return (204, 151, 44)
+        if 7500 <= number <= 7599:
+            return (151, 91, 54)
+        if 7600 <= number <= 7699:
+            return (154, 64, 69)
+        if 7700 <= number <= 7799:
+            return (0, 134, 155)
+        return (125, 125, 125)
+
     seed = sum(ord(ch) for ch in name)
-    return ((seed * 37) % 206 + 25, (seed * 67) % 206 + 25, (seed * 97) % 206 + 25)
+    return ((seed * 37) % 156 + 50, (seed * 67) % 156 + 50, (seed * 97) % 156 + 50)
 
 
 def build_preview_image(

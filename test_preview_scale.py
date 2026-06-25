@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 
-from app import build_preview_image, effective_preview_dpi
+from app import build_preview_image, effective_preview_dpi, preview_ink_rgb
 
 
 class PreviewScaleTests(unittest.TestCase):
@@ -43,6 +43,19 @@ class PreviewScaleTests(unittest.TestCase):
             self.assertAlmostEqual(captured[0], 200.0)
         finally:
             path.unlink(missing_ok=True)
+
+    def test_known_pantone_preview_colors_are_realistic(self) -> None:
+        green = preview_ink_rgb("PANTONE 349 C")
+        brown = preview_ink_rgb("PANTONE 7587 C")
+        self.assertGreater(green[1], green[0])
+        self.assertGreater(green[1], green[2])
+        self.assertGreater(brown[0], brown[2])
+        self.assertGreater(brown[1], brown[2])
+
+    def test_unknown_pantone_uses_number_family_not_hash_color(self) -> None:
+        color = preview_ink_rgb("PANTONE 354 C")
+        self.assertGreater(color[1], color[0])
+        self.assertGreater(color[1], color[2])
 
 
 if __name__ == "__main__":
