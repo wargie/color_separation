@@ -81,7 +81,7 @@ class HalftoneTests(unittest.TestCase):
 
     def test_am_screening_is_limited_to_halftones(self) -> None:
         source = np.array(
-            [[255, 254, 253, 252, 251, 128, 4, 3, 2, 1, 0]],
+            [[255, 254, 253, 252, 251, 128, 16, 9, 8, 4, 0]],
             dtype=np.uint8,
         )
         output = np.asarray(
@@ -95,9 +95,38 @@ class HalftoneTests(unittest.TestCase):
             )
         )
         self.assertTrue(np.all(output[:, :2] == 255))
-        self.assertTrue(np.all(output[:, -2:] == 0))
-        middle = output[:, 2:-2]
-        self.assertTrue(np.any((middle > 0) & (middle < 255)) or np.any(middle != source[:, 2:-2]))
+        self.assertTrue(np.all(output[:, -3:] == 0))
+        middle = output[:, 2:-3]
+        self.assertTrue(np.any((middle > 0) & (middle < 255)) or np.any(middle != source[:, 2:-3]))
+
+    def test_am_keeps_noisy_solids_unbroken(self) -> None:
+        source = np.full((512, 512), 6, dtype=np.uint8)
+        output = np.asarray(
+            apply_halftone(
+                Image.fromarray(source),
+                mode="am",
+                dpi=2400,
+                frequency_lpi=150,
+                angle_deg=45,
+                prefer_gpu=False,
+            )
+        )
+        self.assertTrue(np.all(output == 0))
+
+    def test_am_still_screens_deep_shadows_below_solid_limit(self) -> None:
+        source = np.full((512, 512), 16, dtype=np.uint8)
+        output = np.asarray(
+            apply_halftone(
+                Image.fromarray(source),
+                mode="am",
+                dpi=2400,
+                frequency_lpi=150,
+                angle_deg=45,
+                prefer_gpu=False,
+            )
+        )
+        self.assertGreater(np.count_nonzero(output == 255), 0)
+        self.assertGreater(np.count_nonzero(output == 0), 0)
 
     def test_cell_size_matches_requested_lineature(self) -> None:
         self.assertAlmostEqual(halftone_cell_size(160.952, 150.0), 1.0730133333)

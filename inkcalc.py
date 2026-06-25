@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
 import logging
+from threading import Lock
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -25,11 +27,16 @@ Image.MAX_IMAGE_PIXELS = None
 
 DEFAULT_DPI = 600
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parent / "Separation"
+GHOSTSCRIPT_BITONAL_DIR_NAME = "GhostscriptBitonal"
+GHOSTSCRIPT_PROCESS_TIMEOUT_SECONDS = int(os.environ.get("CALC_GHOSTSCRIPT_TIMEOUT_SECONDS", "1800"))
+GHOSTSCRIPT_BITONAL_MAX_DPI = int(os.environ.get("CALC_TIFFSEP1_MAX_DPI", "1200"))
 SUPPORTED_INPUT_SUFFIXES = {".pdf", ".ps", ".eps"}
 PAREN_NAME_PAT = re.compile(r"\((.+?)\)\.tif$", re.IGNORECASE)
 SEP_PAGE_PAT = re.compile(r"sep_(\d{3})", re.IGNORECASE)
 PLATE_COLOR_PAT = re.compile(r"^%%PlateColor:\s*(.+?)\s*$", re.IGNORECASE)
 logger = logging.getLogger(__name__)
+_active_ghostscript_processes: set[subprocess.Popen[str]] = set()
+_active_ghostscript_lock = Lock()
 
 
 @dataclass(frozen=True)
@@ -82,7 +89,48 @@ def make_output_dir(output_root: Path) -> Path:
     return output_dir
 
 
-def run_tiffsep(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+def _register_ghostscript_process(proc: subprocess.Popen[str]) -> None:
+    with _active_ghostscript_lock:
+        _active_ghostscript_processes.add(proc)
+
+
+def _unregister_ghostscript_process(proc: subprocess.Popen[str]) -> None:
+    with _active_ghostscript_lock:
+        _active_ghostscript_processes.discard(proc)
+
+
+def terminate_active_ghostscript_processes() -> None:
+    with _active_ghostscript_lock:
+        processes = list(_active_ghostscript_processes)
+
+    for proc in processes:
+        if proc.poll() is not None:
+            _unregister_ghostscript_process(proc)
+            continue
+        logger.warning("Terminating active Ghostscript process: pid=%s", proc.pid)
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            logger.warning("Killing unresponsive Ghostscript process: pid=%s", proc.pid)
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                logger.exception("Failed to kill Ghostscript process: pid=%s", proc.pid)
+        finally:
+            _unregister_ghostscript_process(proc)
+
+
+def run_ghostscript_tiff_device(
+    gs_path: str,
+    source_path: Path,
+    output_dir: Path,
+    dpi: int,
+    *,
+    device: str,
+    timeout_seconds: int = GHOSTSCRIPT_PROCESS_TIMEOUT_SECONDS,
+) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "sep_%03d.tif"
     cmd = [
@@ -90,7 +138,7 @@ def run_tiffsep(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> 
         "-dNOPAUSE",
         "-dBATCH",
         "-dSAFER",
-        "-sDEVICE=tiffsep",
+        f"-sDEVICE={device}",
         f"-r{dpi}",
         "-dSimulateOverprint=true",
         "-dOverprint=true",
@@ -98,23 +146,52 @@ def run_tiffsep(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> 
         f"-sOutputFile={output_file}",
         str(source_path),
     ]
-    logger.info("Running Ghostscript tiffsep: source=%s dpi=%s output=%s", source_path, dpi, output_dir)
+    logger.info("Running Ghostscript %s: source=%s dpi=%s output=%s", device, source_path, dpi, output_dir)
     logger.debug("Ghostscript command: %s", " ".join(cmd))
-    proc = subprocess.run(
+    creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=creationflags,
     )
+    _register_ghostscript_process(proc)
+    try:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            logger.error("Ghostscript %s timed out after %s seconds: source=%s", device, timeout_seconds, source_path)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            raise RuntimeError(f"Ghostscript {device} не ответил за {timeout_seconds} сек. Уменьшите DPI или упростите файл.") from exc
+    finally:
+        _unregister_ghostscript_process(proc)
     if proc.returncode != 0:
-        details = proc.stderr.strip() or proc.stdout.strip()
-        logger.error("Ghostscript failed with code %s: %s", proc.returncode, details)
-        raise RuntimeError(f"Ghostscript завершился с ошибкой {proc.returncode}:\n{details}")
+        details = stderr.strip() or stdout.strip()
+        logger.error("Ghostscript %s failed with code %s: %s", device, proc.returncode, details)
+        raise RuntimeError(f"Ghostscript {device} завершился с ошибкой {proc.returncode}:\n{details}")
     tiffs = sorted(output_dir.glob("sep_*.tif"))
-    logger.info("Ghostscript created %s TIFF files", len(tiffs))
+    logger.info("Ghostscript %s created %s TIFF files", device, len(tiffs))
     return tiffs
+
+
+def run_tiffsep(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+    return run_ghostscript_tiff_device(gs_path, source_path, output_dir, dpi, device="tiffsep")
+
+
+def run_tiffsep1(gs_path: str, source_path: Path, output_dir: Path, dpi: int) -> list[Path]:
+    return run_ghostscript_tiff_device(gs_path, source_path, output_dir, dpi, device="tiffsep1")
+
+
+def should_generate_ghostscript_bitonal(dpi: int) -> bool:
+    return dpi <= GHOSTSCRIPT_BITONAL_MAX_DPI
 
 
 def classify_plate(path: Path) -> tuple[str, str]:
@@ -322,6 +399,70 @@ def normalize_plate_bitmasks(plate_paths: dict[str, Path]) -> dict[str, Path]:
     return normalized
 
 
+def collect_ghostscript_bitonal_plates(source_path: Path, tiffs: list[Path]) -> dict[str, Path]:
+    source_is_separated_ps = source_path.suffix.lower() in {".ps", ".eps"}
+    ps_plate_colors = extract_postscript_plate_colors(source_path)
+    bitonal_paths: dict[str, Path] = {}
+
+    for tiff in tiffs:
+        kind, label = classify_plate(tiff)
+        page_index = sep_page_index(tiff)
+        if kind == "COMPOSITE":
+            if not (source_is_separated_ps and page_index and page_index <= len(ps_plate_colors)):
+                continue
+            kind, label = ps_plate_colors[page_index - 1]
+
+        total, _count = tiff_sum_and_count_inverted(tiff)
+        if total == 0:
+            logger.debug("Skipping empty Ghostscript bitonal plate: file=%s label=%s", tiff, label)
+            continue
+
+        if source_is_separated_ps and page_index and page_index <= len(ps_plate_colors):
+            _kind, label = ps_plate_colors[page_index - 1]
+
+        bitonal_paths[label] = tiff
+
+    return bitonal_paths
+
+
+def generate_ghostscript_bitonal_plates(
+    gs_path: str,
+    source_paths: list[Path],
+    output_dir: Path,
+    dpi: int,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Path]:
+    if not should_generate_ghostscript_bitonal(dpi):
+        logger.info(
+            "Skipping Ghostscript tiffsep1 bitonal pass at high DPI: dpi=%s max_dpi=%s",
+            dpi,
+            GHOSTSCRIPT_BITONAL_MAX_DPI,
+        )
+        if progress:
+            progress(f"1-bit RIP-сепарации пропущены для {dpi} dpi")
+        return {}
+
+    bitonal_root = output_dir / GHOSTSCRIPT_BITONAL_DIR_NAME
+    bitonal_paths: dict[str, Path] = {}
+
+    for index, source_path in enumerate(source_paths, start=1):
+        if progress:
+            progress(f"Генерация 1-bit RIP-сепараций {index}/{len(source_paths)}...")
+        source_output_dir = bitonal_root if len(source_paths) == 1 else bitonal_root / f"{index:03d}_{source_path.stem}"
+        try:
+            tiffs = run_tiffsep1(gs_path, source_path, source_output_dir, dpi)
+        except Exception as exc:
+            logger.warning("Ghostscript tiffsep1 output is unavailable; grayscale separations will be used: %s (%s)", source_path, exc)
+            continue
+        bitonal_paths.update(collect_ghostscript_bitonal_plates(source_path, tiffs))
+
+    if bitonal_paths:
+        logger.info("Ghostscript tiffsep1 bitonal plates collected: %s", bitonal_paths)
+    return bitonal_paths
+
+
+
+
 def calculate_sources_coverage(
     source_paths: list[Path],
     dpi: int = DEFAULT_DPI,
@@ -383,7 +524,11 @@ def calculate_sources_coverage(
     cleanup_unused_tiffs(all_tiffs, used_tiffs)
     renamed_paths = rename_used_tiffs(rename_labels)
     plate_paths = {label: renamed_paths.get(path, path) for label, path in plate_paths.items()}
+    ghostscript_bitonal_paths = generate_ghostscript_bitonal_plates(gs_path, source_paths, output_dir, dpi, progress)
     plate_paths = normalize_plate_bitmasks(plate_paths)
+    for label, path in ghostscript_bitonal_paths.items():
+        if label in sums:
+            plate_paths[label] = path
 
     order = {"C": 0, "M": 1, "Y": 2, "K": 3}
     labels = sorted(sums, key=lambda value: (order.get(value, 100), value.lower()))

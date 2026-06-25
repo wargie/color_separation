@@ -68,7 +68,7 @@ __kernel void halftone(
         output[index] = (uchar)255;
         return;
     }
-    if (source <= (uchar)1) {
+    if (source <= (uchar)8) {
         output[index] = (uchar)0;
         return;
     }

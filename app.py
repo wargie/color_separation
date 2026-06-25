@@ -61,7 +61,7 @@ except Exception:
     raise
 
 try:
-    from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_sources_coverage, first_supported_file_near_script
+    from inkcalc import DEFAULT_DPI, DEFAULT_OUTPUT_ROOT, CoverageResult, calculate_sources_coverage, first_supported_file_near_script, terminate_active_ghostscript_processes
     from halftone import (
         DEFAULT_SCREEN_FREQUENCY,
         SCREEN_MODE_AM,
@@ -661,6 +661,14 @@ class MainWindow(QMainWindow):
             self.thread.deleteLater()
         self.worker = None
         self.thread = None
+
+    def closeEvent(self, event: object) -> None:
+        logger.info("Application window closing; terminating active Ghostscript processes")
+        terminate_active_ghostscript_processes()
+        if self.thread and self.thread.isRunning():
+            self.thread.quit()
+            self.thread.wait(3000)
+        super().closeEvent(event)
 
     def set_busy(self, busy: bool) -> None:
         self.calculate_button.setEnabled(not busy)
