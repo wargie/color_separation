@@ -16,6 +16,7 @@ logger.info("Application bootstrap started. Log file: %s", LOG_FILE)
 
 INTERACTIVE_PREVIEW_MAX_SIZE = 4096
 DISPLAY_PREVIEW_MAX_SIDE = 8192
+APP_ICON_PATH = Path(__file__).resolve().parent / "Logo.ico"
 
 
 try:
@@ -27,7 +28,7 @@ except Exception:
 
 try:
     from PySide6.QtCore import QObject, QSize, Qt, QThread, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QImage, QPixmap, QTransform
+    from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QImage, QPixmap, QTransform
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -114,6 +115,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Color Separation Workstation")
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
         self.resize(1280, 800)
 
         self.thread: QThread | None = None

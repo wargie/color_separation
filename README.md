@@ -50,7 +50,7 @@ Logs/app.log
 
 ```powershell
 py -m pip install pyinstaller
-py -m PyInstaller --noconsole --onefile --name InkCoverageCalc app.py
+py -m PyInstaller --noconsole --onefile --name InkCoverageCalc --icon Logo.ico app.py
 ```
 
 Готовый файл появится в папке `dist`.
