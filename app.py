@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 logger.info("Application bootstrap started. Log file: %s", LOG_FILE)
 
 INTERACTIVE_PREVIEW_MAX_SIZE = 4096
+SCREENED_PREVIEW_MAX_SIZE = 1600
 DISPLAY_PREVIEW_MAX_SIDE = 8192
 APP_ICON_PATH = Path(__file__).resolve().parent / "Logo.ico"
 
@@ -49,6 +50,7 @@ try:
         QPushButton,
         QScrollArea,
         QSlider,
+        QSizePolicy,
         QSplitter,
         QSpinBox,
         QStyle,
@@ -76,6 +78,7 @@ try:
         default_screen_angle,
     )
     from gpu_halftone import compute_backend_name
+    from native_backend import processing_plan_label
     from ppd_profiles import PpdProfile, discover_ppd_profiles, parse_ppd
     from rip_core import layers_from_dicts, render_preview
 except Exception:
@@ -111,6 +114,54 @@ class CalculationWorker(QObject):
         self.finished.emit(result)
 
 
+class PreviewWorker(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        layers: list[dict[str, object]],
+        max_size: int,
+        dpi: int,
+        screen_mode: str,
+        fallback_frequency_lpi: float,
+        spot_shape: str,
+    ) -> None:
+        super().__init__()
+        self.layers = [dict(layer) for layer in layers]
+        self.max_size = max_size
+        self.dpi = dpi
+        self.screen_mode = screen_mode
+        self.fallback_frequency_lpi = fallback_frequency_lpi
+        self.spot_shape = spot_shape
+
+    def run(self) -> None:
+        try:
+            logger.info(
+                "Preview worker started: layers=%s max_size=%s dpi=%s screen_mode=%s frequency=%s shape=%s",
+                [layer.get("name") for layer in self.layers],
+                self.max_size,
+                self.dpi,
+                self.screen_mode,
+                self.fallback_frequency_lpi,
+                self.spot_shape,
+            )
+            preview = build_preview_image(
+                self.layers,
+                max_size=self.max_size,
+                dpi=self.dpi,
+                screen_mode=self.screen_mode,
+                fallback_frequency_lpi=self.fallback_frequency_lpi,
+                spot_shape=self.spot_shape,
+            )
+        except Exception as exc:
+            logger.exception("Preview worker failed")
+            self.failed.emit(str(exc))
+            return
+        logger.info("Preview worker finished: size=%s", preview.size)
+        self.finished.emit(preview)
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -130,6 +181,9 @@ class MainWindow(QMainWindow):
         self.ppd_profiles = discover_ppd_profiles(Path(__file__).resolve().parent)
         self.profile_sync_in_progress = False
         self.preview_render_pending = False
+        self.preview_thread: QThread | None = None
+        self.preview_worker: PreviewWorker | None = None
+        self.preview_thread_running = False
         self.preview_render_timer = QTimer(self)
         self.preview_render_timer.setSingleShot(True)
         self.preview_render_timer.timeout.connect(self.render_preview)
@@ -211,7 +265,9 @@ class MainWindow(QMainWindow):
         self.screen_frequency_input.setValue(DEFAULT_SCREEN_FREQUENCY)
         self.screen_frequency_input.valueChanged.connect(self.on_screen_settings_changed)
         self.dpi_input.valueChanged.connect(self.on_screen_settings_changed)
-        self.compute_backend_label = QLabel(compute_backend_name())
+        self.compute_backend_label = QLabel(self.short_backend_label())
+        self.compute_backend_label.setToolTip(processing_plan_label())
+        self.compute_backend_label.setMinimumWidth(0)
 
         self.preview_label = QLabel("Предпросмотр появится после расчёта")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -236,6 +292,12 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._apply_style()
         logger.info("Main window initialized")
+
+    def short_backend_label(self) -> str:
+        compute = compute_backend_name()
+        if compute.startswith("OpenCL GPU"):
+            compute = "OpenCL GPU"
+        return f"{compute} | Python tiles"
 
     def _build_layout(self) -> None:
         root = QWidget()
@@ -411,6 +473,7 @@ class MainWindow(QMainWindow):
         button.setFixedSize(28, 26)
         button.clicked.connect(callback)
         return button
+
     def _apply_style(self) -> None:
         self.setFont(QFont("Segoe UI", 9))
         self.setStyleSheet(
@@ -481,17 +544,16 @@ class MainWindow(QMainWindow):
                 selection-background-color: #cce7f6;
                 selection-color: #151515;
             }
-            QListWidget::item { min-height: 28px; border-bottom: 1px solid #e3e3e3; }
+            QListWidget::item { min-height: 32px; border-bottom: 1px solid #e3e3e3; }
             QCheckBox { spacing: 7px; }
             QCheckBox::indicator { width: 15px; height: 15px; }
-            QSpinBox::up-button, QSpinBox::down-button { width: 22px; border-left: 1px solid #aeb5bb; background: #f5f7f8; }
-            QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #e3eef7; }
             QHeaderView::section { background: #e2e5e8; border: 0; border-right: 1px solid #c3c7ca; padding: 3px; }
             QSlider::groove:horizontal { height: 3px; background: #c1c5c8; }
             QSlider::handle:horizontal { width: 10px; margin: -5px 0; background: #8e969d; border: 1px solid #6f777d; }
             QLabel { color: #24282b; }
             """
         )
+
     def _set_default_spot_shapes(self) -> None:
         self.spot_shape_input.blockSignals(True)
         self.spot_shape_input.clear()
@@ -581,11 +643,20 @@ class MainWindow(QMainWindow):
 
     def refresh_layer_labels(self) -> None:
         for row, layer in enumerate(self.preview_layers):
-            if row < len(self.layer_checkboxes):
-                self.layer_checkboxes[row].setText(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
             item = self.layer_list.item(row)
+            angle = float(layer.get("angle_deg") or 0)
             if item is not None:
-                item.setData(Qt.ItemDataRole.DisplayRole, f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
+                item.setData(Qt.ItemDataRole.DisplayRole, f"{layer['name']}  {angle:g}°")
+            widget = self.layer_list.itemWidget(item) if item is not None else None
+            if widget is None:
+                continue
+            name_label = widget.findChild(QLabel, "layerName")
+            angle_label = widget.findChild(QLabel, "layerAngle")
+            if name_label is not None:
+                name_label.setText(str(layer["name"]))
+                name_label.setToolTip(f"{layer['name']}  {angle:g}°")
+            if angle_label is not None:
+                angle_label.setText(f"{angle:g}°")
 
     def choose_sources(self) -> None:
         logger.info("User opened input file chooser")
@@ -684,6 +755,9 @@ class MainWindow(QMainWindow):
         if self.thread and self.thread.isRunning():
             self.thread.quit()
             self.thread.wait(3000)
+        if self.preview_thread and self.preview_thread.isRunning():
+            self.preview_thread.quit()
+            self.preview_thread.wait(3000)
         super().closeEvent(event)
 
     def set_busy(self, busy: bool) -> None:
@@ -737,8 +811,10 @@ class MainWindow(QMainWindow):
             self.preview_layers.append(layer)
         self.rebuild_layer_list()
         self.preview_zoom = 1.0
-        self.render_preview()
-        self.fit_preview()
+        self.preview_label.setText("Подготовка предпросмотра...")
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_pixmap = None
+        self.schedule_render_preview(50)
 
     def rebuild_layer_list(self) -> None:
         self.layer_checkboxes = []
@@ -748,7 +824,7 @@ class MainWindow(QMainWindow):
             angle = float(layer.get("angle_deg") or 0)
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.DisplayRole, f"{layer['name']}  {angle:g}°")
-            item.setSizeHint(QSize(240, 28))
+            item.setSizeHint(QSize(260, 32))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.layer_list.addItem(item)
             self.layer_list.setItemWidget(item, self.create_layer_widget(row))
@@ -758,21 +834,39 @@ class MainWindow(QMainWindow):
         layer = self.preview_layers[row]
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(6)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(5)
 
-        checkbox = QCheckBox(f"{layer['name']}  {float(layer.get('angle_deg') or 0):g}°")
+        checkbox = QCheckBox()
+        checkbox.setFixedWidth(18)
         checkbox.setChecked(bool(layer.get("enabled", True)))
+        checkbox.setToolTip("Включить/выключить канал")
         checkbox.toggled.connect(lambda checked, cb=checkbox: self.on_layer_checkbox_toggled(cb, checked))
         self.layer_checkboxes.append(checkbox)
 
         swatch = QLabel()
-        swatch.setFixedSize(12, 12)
+        swatch.setFixedSize(11, 11)
         color = QColor(*preview_ink_rgb(str(layer["name"])))
         swatch.setStyleSheet(f"background: {color.name()}; border: 1px solid #7e858b;")
 
-        layout.addWidget(checkbox, 1)
+        name = str(layer["name"])
+        angle = float(layer.get("angle_deg") or 0)
+        name_label = QLabel(name)
+        name_label.setObjectName("layerName")
+        name_label.setFixedWidth(145)
+        name_label.setMinimumWidth(0)
+        name_label.setToolTip(f"{name}  {angle:g}°")
+        name_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+
+        angle_label = QLabel(f"{angle:g}°")
+        angle_label.setObjectName("layerAngle")
+        angle_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        angle_label.setMinimumWidth(38)
+
+        layout.addWidget(checkbox)
         layout.addWidget(swatch)
+        layout.addWidget(name_label, 1)
+        layout.addWidget(angle_label)
         return widget
 
     def on_layer_checkbox_toggled(self, checkbox: QCheckBox, checked: bool) -> None:
@@ -903,28 +997,58 @@ class MainWindow(QMainWindow):
             self.preview_label.setPixmap(QPixmap())
             self.preview_pixmap = None
             return
-
-        try:
-            preview = build_preview_image(
-                enabled_layers,
-                max_size=INTERACTIVE_PREVIEW_MAX_SIZE,
-                dpi=self.dpi_input.value(),
-                screen_mode=str(self.screen_mode_input.currentData()),
-                fallback_frequency_lpi=float(self.screen_frequency_input.value()),
-                spot_shape=str(self.spot_shape_input.currentData()),
-            )
-        except Exception:
-            logger.exception("Failed to render separation preview")
-            self.preview_label.setText("Не удалось построить предпросмотр")
-            self.preview_label.setPixmap(QPixmap())
-            self.preview_pixmap = None
+        if self.preview_thread_running:
+            self.preview_render_pending = True
+            logger.info("Preview render requested while worker is busy; queued latest request")
             return
 
+        screen_mode = str(self.screen_mode_input.currentData())
+        max_size = SCREENED_PREVIEW_MAX_SIZE if screen_mode != SCREEN_MODE_NONE else INTERACTIVE_PREVIEW_MAX_SIZE
+        self.preview_thread_running = True
+        self.status_label.setText("Обновление предпросмотра...")
+        self.preview_thread = QThread(self)
+        self.preview_worker = PreviewWorker(
+            enabled_layers,
+            max_size=max_size,
+            dpi=self.dpi_input.value(),
+            screen_mode=screen_mode,
+            fallback_frequency_lpi=float(self.screen_frequency_input.value()),
+            spot_shape=str(self.spot_shape_input.currentData()),
+        )
+        self.preview_worker.moveToThread(self.preview_thread)
+        self.preview_thread.started.connect(self.preview_worker.run)
+        self.preview_worker.finished.connect(self.on_preview_finished)
+        self.preview_worker.failed.connect(self.on_preview_failed)
+        self.preview_worker.finished.connect(self.preview_thread.quit)
+        self.preview_worker.failed.connect(self.preview_thread.quit)
+        self.preview_thread.finished.connect(self.cleanup_preview_worker)
+        self.preview_thread.start()
+
+    def on_preview_finished(self, preview: Image.Image) -> None:
         qimage = pil_image_to_qimage(preview)
         self.preview_pixmap = QPixmap.fromImage(qimage)
         self.apply_preview_zoom()
+        self.fit_preview()
         if self.last_result:
             self.status_label.setText(f"Готово. Файлы цветоделения: {self.last_result.output_dir}")
+
+    def on_preview_failed(self, message: str) -> None:
+        logger.error("Failed to render separation preview: %s", message)
+        self.preview_label.setText("Не удалось построить предпросмотр")
+        self.preview_label.setPixmap(QPixmap())
+        self.preview_pixmap = None
+
+    def cleanup_preview_worker(self) -> None:
+        logger.info("Cleaning up preview worker thread")
+        if self.preview_worker:
+            self.preview_worker.deleteLater()
+        if self.preview_thread:
+            self.preview_thread.deleteLater()
+        self.preview_worker = None
+        self.preview_thread = None
+        self.preview_thread_running = False
+        if self.preview_render_pending:
+            self.schedule_render_preview(50)
 
     def apply_preview_zoom(self) -> None:
         if self.preview_pixmap is None:

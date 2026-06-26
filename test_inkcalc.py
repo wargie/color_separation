@@ -60,9 +60,9 @@ class HangingGhostscriptProcess(FakeGhostscriptProcess):
 
 class InkcalcGhostscriptBitonalTests(unittest.TestCase):
     def test_run_tiffsep1_uses_ghostscript_bitonal_device(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "job.pdf"
             source.write_bytes(b"%PDF-1.4\n")
@@ -79,9 +79,9 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
             self.assertEqual([path.name for path in tiffs], ["sep_001(Cyan).tif"])
 
     def test_collect_named_tiffsep1_plates(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "job.pdf"
             source.write_bytes(b"%PDF-1.4\n")
@@ -95,9 +95,9 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
             self.assertEqual(plates, {"C": cyan})
 
     def test_collect_separated_ps_composite_pages_from_plate_color(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "separated.ps"
             source.write_text("%%PlateColor: Magenta\n", encoding="latin-1")
@@ -109,9 +109,9 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
             self.assertEqual(plates, {"M": page})
 
     def test_generate_ghostscript_bitonal_is_optional(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "job.pdf"
             source.write_bytes(b"%PDF-1.4\n")
@@ -122,9 +122,9 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
             self.assertEqual(plates, {})
 
     def test_high_dpi_skips_optional_tiffsep1_pass(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "job.pdf"
             source.write_bytes(b"%PDF-1.4\n")
@@ -138,9 +138,9 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
             self.assertTrue(any("пропущены" in item for item in progress))
 
     def test_ghostscript_timeout_reports_actionable_error(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             source = root / "job.pdf"
             source.write_bytes(b"%PDF-1.4\n")
@@ -154,7 +154,7 @@ class InkcalcGhostscriptBitonalTests(unittest.TestCase):
 
         with patch("inkcalc.subprocess.Popen", return_value=process):
             with self.assertRaisesRegex(RuntimeError, "не ответил"):
-                run_ghostscript_tiff_device("gs", Path("job.pdf"), Path(r"C:\tmp"), 600, device="tiffsep", timeout_seconds=1)
+                run_ghostscript_tiff_device("gs", Path("job.pdf"), (Path(__file__).resolve().parent / ".test_tmp"), 600, device="tiffsep", timeout_seconds=1)
 
         self.assertTrue(process.terminated or process.killed)
         terminate_active_ghostscript_processes()

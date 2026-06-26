@@ -3,18 +3,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import ctypes
 import logging
 import math
-import os
 from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
 from PIL import Image
 
-from halftone import DEFAULT_SCREEN_FREQUENCY, SCREEN_MODE_NONE, apply_halftone, default_screen_angle
+from halftone import (
+    DEFAULT_SCREEN_FREQUENCY,
+    SCREEN_MODE_AM,
+    SCREEN_MODE_ERROR_DIFFUSION,
+    SCREEN_MODE_FLEXO,
+    SCREEN_MODE_FM,
+    SCREEN_MODE_HYBRID,
+    SCREEN_MODE_NONE,
+    apply_halftone,
+    default_screen_angle,
+)
 from inkcalc import DEFAULT_DPI
+from native_backend import (
+    ALGORITHM_AM,
+    ALGORITHM_ERROR_DIFFUSION,
+    ALGORITHM_FLEXO,
+    ALGORITHM_FM,
+    ALGORITHM_HYBRID,
+    BACKEND_PYTHON_REFERENCE,
+    DOT_CIRCLE,
+    DOT_ELLIPSE,
+    DOT_LINE,
+    DOT_SQUARE,
+    BackendConfig,
+    RipTileParams,
+    get_native_backend,
+    selected_backend_label,
+)
 from plate_bits import is_bitonal_plate
 
 
@@ -42,33 +66,8 @@ class TileRenderRequest:
     tile_size: int = 512
 
 
-class NativeRipCore:
-    def __init__(self, dll_path: Path | None = None) -> None:
-        root = Path(__file__).resolve().parent
-        candidate = dll_path or Path(os.environ.get("RIP_CORE_NATIVE_DLL", root / "native" / "rip_core_native.dll"))
-        self.dll_path = candidate
-        self.available = False
-        self._dll: ctypes.CDLL | None = None
-        if candidate.exists():
-            try:
-                self._dll = ctypes.CDLL(str(candidate))
-                self.available = True
-            except OSError as exc:
-                logger.warning("Native RIP core is unavailable: %s", exc)
-
-    @property
-    def name(self) -> str:
-        return f"Native DLL: {self.dll_path}" if self.available else "Python tiled renderer"
-
-
-_native_core: NativeRipCore | None = None
-
-
 def backend_name() -> str:
-    global _native_core
-    if _native_core is None:
-        _native_core = NativeRipCore()
-    return _native_core.name
+    return selected_backend_label()
 
 
 def layers_from_dicts(layers: Iterable[dict[str, object]]) -> list[RenderLayer]:
@@ -179,12 +178,13 @@ def _render_tile_python(
         if screen_mode != SCREEN_MODE_NONE and not bitonal:
             frequency = layer.frequency_lpi or fallback_frequency_lpi
             angle = layer.angle_deg if layer.angle_deg is not None else default_screen_angle(layer.name)
-            gray = apply_halftone(
+            gray = _apply_preview_halftone(
                 gray,
                 mode=screen_mode,
                 dpi=max(1.0, dpi * output_scale),
                 frequency_lpi=float(frequency),
                 angle_deg=float(angle),
+                tile_origin=(left, top),
                 spot_shape=spot_shape,
             )
 
@@ -194,6 +194,101 @@ def _render_tile_python(
         composite *= transmittance
 
     return Image.fromarray(np.clip(composite, 0, 255).astype(np.uint8))
+
+
+
+def _apply_preview_halftone(
+    gray: Image.Image,
+    *,
+    mode: str,
+    dpi: float,
+    frequency_lpi: float,
+    angle_deg: float,
+    tile_origin: tuple[int, int],
+    spot_shape: str,
+) -> Image.Image:
+    if _can_use_native_screening(mode):
+        try:
+            return _apply_native_halftone(
+                gray,
+                mode=mode,
+                dpi=dpi,
+                frequency_lpi=frequency_lpi,
+                angle_deg=angle_deg,
+                tile_origin=tile_origin,
+                spot_shape=spot_shape,
+            )
+        except Exception:
+            logger.exception("Native preview screening failed, falling back to Python")
+    return apply_halftone(
+        gray,
+        mode=mode,
+        dpi=dpi,
+        frequency_lpi=frequency_lpi,
+        angle_deg=angle_deg,
+        spot_shape=spot_shape,
+    )
+
+
+def _can_use_native_screening(mode: str) -> bool:
+    if mode == SCREEN_MODE_NONE:
+        return False
+    config = BackendConfig.from_environment()
+    if config.mode == BACKEND_PYTHON_REFERENCE:
+        return False
+    return get_native_backend().available
+
+
+def _apply_native_halftone(
+    gray: Image.Image,
+    *,
+    mode: str,
+    dpi: float,
+    frequency_lpi: float,
+    angle_deg: float,
+    tile_origin: tuple[int, int],
+    spot_shape: str,
+) -> Image.Image:
+    source = gray.convert("L")
+    width, height = source.size
+    params = RipTileParams(
+        width=width,
+        height=height,
+        input_stride=width,
+        output_stride=width,
+        tile_x=max(0, int(tile_origin[0])),
+        tile_y=max(0, int(tile_origin[1])),
+        dpi=float(dpi),
+        lpi=float(frequency_lpi),
+        angle_deg=float(angle_deg),
+        min_dot=0.02 if mode == SCREEN_MODE_FLEXO else 0.0,
+        algorithm=_native_algorithm(mode),
+        dot_shape=_native_dot_shape(spot_shape),
+        flags=0,
+    )
+    mask = get_native_backend().screen_tile(source.tobytes(), params)
+    screened = np.frombuffer(mask, dtype=np.uint8).reshape((height, width))
+    screened_gray = np.where(screened > 0, 0, 255).astype(np.uint8)
+    return Image.fromarray(screened_gray)
+
+
+def _native_algorithm(mode: str) -> int:
+    return {
+        SCREEN_MODE_AM: ALGORITHM_AM,
+        SCREEN_MODE_FM: ALGORITHM_FM,
+        SCREEN_MODE_HYBRID: ALGORITHM_HYBRID,
+        SCREEN_MODE_FLEXO: ALGORITHM_FLEXO,
+        SCREEN_MODE_ERROR_DIFFUSION: ALGORITHM_ERROR_DIFFUSION,
+    }.get(mode, ALGORITHM_AM)
+
+
+def _native_dot_shape(spot_shape: str) -> int:
+    return {
+        "circle": DOT_CIRCLE,
+        "ellipse": DOT_ELLIPSE,
+        "square": DOT_SQUARE,
+        "line": DOT_LINE,
+    }.get(spot_shape, DOT_CIRCLE)
 
 
 def _map_source_box(

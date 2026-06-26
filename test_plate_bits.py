@@ -15,9 +15,9 @@ from plate_bits import BITONAL_DIR_NAME, is_bitonal_plate, is_prescreened_plate,
 
 class PlateBitsTests(unittest.TestCase):
     def test_binary_plate_is_saved_as_one_bit_tiff(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             source = Path(tmp) / "spot.tif"
             arr = np.array([[255, 255, 0, 0], [255, 0, 255, 0]], dtype=np.uint8)
             Image.fromarray(arr).save(source)
@@ -37,9 +37,9 @@ class PlateBitsTests(unittest.TestCase):
             gc.collect()
 
     def test_limited_tone_plate_is_not_forced_to_one_bit(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             source = Path(tmp) / "limited.tif"
             arr = np.array([[255, 255, 70, 0], [255, 128, 255, 0]], dtype=np.uint8)
             Image.fromarray(arr).save(source)

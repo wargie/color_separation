@@ -94,17 +94,25 @@ Separation/temp_YYYY-MM-DD_HH-MM-SS
 
 ## Архитектура
 
+Проект строится как двухслойная система:
+
+- Python остаётся оболочкой, workflow, GUI, прототипом алгоритмов и reference implementation для тестов.
+- C++/Rust backend предназначен для тяжёлой обработки больших TIFF: tiles/stripes, memory mapping, многопоточность, 1-bit TIFF writer и низкоуровневый контроль памяти.
+
+Большие формы нельзя обрабатывать как один NumPy-массив. Например, лист 600 x 400 мм при 2400 dpi даёт примерно 56,688 x 37,800 пикселей, то есть около 2.14 ГБ на один 8-bit канал без временных буферов. Поэтому production-путь должен быть тайловым или строчным.
+
 Ключевые файлы:
 
 - `app.py` - PySide6 GUI, управление задачей, предпросмотр и пользовательские действия.
 - `inkcalc.py` - запуск Ghostscript, разбор входов, расчёт покрытия и подготовка сепараций.
 - `rip_core.py` - tiled renderer предпросмотра и смешивание каналов.
+- `native_backend.py` - выбор Python/native backend, env-настройки tiles/stripes/mmap и ctypes ABI.
 - `halftone.py` - алгоритмы растрирования и разбор PostScript-параметров.
 - `gpu_halftone.py` - OpenCL/GPU backend с fallback на CPU.
 - `plate_bits.py` - сохранение бинарных пластин.
 - `ppd_profiles.py` - чтение PPD-профилей.
 - `app_logging.py` - настройка логирования.
-- `native/` - C++ ABI-шаблон для будущего нативного renderer/backend.
+- `native/` - C++ ABI-шаблон для будущего нативного renderer/backend; контракт описан в `native/README.md`.
 
 ## Логи
 
@@ -121,13 +129,15 @@ Logs/app.log
 Запуск основного набора тестов:
 
 ```powershell
-py -m unittest -q test_preview_scale.py test_inkcalc.py test_halftone.py test_ppd_profiles.py test_rip_core.py test_plate_bits.py
+python .\scripts\run_tests.py --timeout 30
 ```
+
+Runner запускает каждый файл тестов отдельно, с таймаутом и принудительным завершением тестового процесса. Это важно на Windows: Qt, Pillow, OpenCL и Ghostscript могут кратковременно держать файловые handles после завершения теста.
 
 Быстрая проверка синтаксиса:
 
 ```powershell
-py -m py_compile app.py inkcalc.py halftone.py rip_core.py gpu_halftone.py plate_bits.py ppd_profiles.py app_logging.py
+py -m py_compile app.py inkcalc.py halftone.py rip_core.py gpu_halftone.py native_backend.py plate_bits.py ppd_profiles.py app_logging.py
 ```
 
 ## Сборка EXE

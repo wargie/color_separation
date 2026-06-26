@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -17,9 +18,9 @@ from rip_core import RenderLayer, backend_name, render_preview
 
 class RipCoreTests(unittest.TestCase):
     def test_tiled_preview_scales_and_composites_layers(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             root = Path(tmp)
             cyan = root / "c.tif"
             yellow = root / "y.tif"
@@ -52,9 +53,9 @@ class RipCoreTests(unittest.TestCase):
 
 
     def test_limited_tone_layer_can_be_screened(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             source = Path(tmp) / "limited.tif"
             arr = np.array([[255, 70, 128, 0]] * 32, dtype=np.uint8)
             Image.fromarray(arr).save(source)
@@ -65,21 +66,22 @@ class RipCoreTests(unittest.TestCase):
                 calls.append(str(kwargs["mode"]))
                 return image
 
-            with patch("rip_core.apply_halftone", side_effect=capture):
-                render_preview(
-                    [RenderLayer(path=source, name="C", angle_deg=45, frequency_lpi=150)],
-                    color_resolver=lambda _name: (0, 174, 239),
-                    screen_mode="am",
-                    max_size=64,
-                    tile_size=64,
-                )
+            with patch.dict("os.environ", {"RIP_BACKEND": "python_reference"}, clear=False):
+                with patch("rip_core.apply_halftone", side_effect=capture):
+                    render_preview(
+                        [RenderLayer(path=source, name="C", angle_deg=45, frequency_lpi=150)],
+                        color_resolver=lambda _name: (0, 174, 239),
+                        screen_mode="am",
+                        max_size=64,
+                        tile_size=64,
+                    )
 
             self.assertEqual(calls, ["am"])
 
     def test_bitonal_layer_is_not_rescreened(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=temp_root) as tmp:
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as tmp:
             source = Path(tmp) / "binary.tif"
             arr = np.array([[255, 0, 255, 0]] * 32, dtype=np.uint8)
             Image.fromarray(arr).save(source)
@@ -96,7 +98,8 @@ class RipCoreTests(unittest.TestCase):
             mocked.assert_not_called()
 
     def test_backend_name_is_stable_without_native_dll(self) -> None:
-        self.assertIn("renderer", backend_name().lower())
+        label = backend_name().lower()
+        self.assertTrue("renderer" in label or "native rip core" in label)
 
 
 if __name__ == "__main__":

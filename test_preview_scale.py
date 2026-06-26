@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -18,7 +19,7 @@ class PreviewScaleTests(unittest.TestCase):
         self.assertAlmostEqual(effective_preview_dpi(2000, 0.16), 320.0)
 
     def test_preview_halftone_uses_scaled_dpi(self) -> None:
-        temp_root = Path(r"C:\tmp")
+        temp_root = (Path(__file__).resolve().parent / ".test_tmp")
         temp_root.mkdir(exist_ok=True)
         with tempfile.NamedTemporaryFile(suffix=".tif", dir=temp_root, delete=False) as handle:
             path = Path(handle.name)
@@ -31,18 +32,22 @@ class PreviewScaleTests(unittest.TestCase):
                 captured.append(float(kwargs["dpi"]))
                 return image
 
-            with patch("rip_core.apply_halftone", side_effect=capture):
-                build_preview_image(
-                    [{"name": "K", "path": path, "enabled": True, "angle_deg": 45.0}],
-                    max_size=200,
-                    dpi=1000,
-                    screen_mode="am",
-                    fallback_frequency_lpi=100,
-                )
+            with patch.dict("os.environ", {"RIP_BACKEND": "python_reference"}, clear=False):
+                with patch("rip_core.apply_halftone", side_effect=capture):
+                    build_preview_image(
+                        [{"name": "K", "path": path, "enabled": True, "angle_deg": 45.0}],
+                        max_size=200,
+                        dpi=1000,
+                        screen_mode="am",
+                        fallback_frequency_lpi=100,
+                    )
             self.assertEqual(len(captured), 1)
             self.assertAlmostEqual(captured[0], 200.0)
         finally:
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def test_known_pantone_preview_colors_are_realistic(self) -> None:
         green = preview_ink_rgb("PANTONE 349 C")
